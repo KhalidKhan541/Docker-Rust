@@ -1,0 +1,18 @@
+[package]
+name = "docker-events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Engine-event model and in-process publish/subscribe broker"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+docker-errors = { workspace = true }
+docker-logging = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
