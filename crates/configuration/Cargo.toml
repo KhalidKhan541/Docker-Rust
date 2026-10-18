@@ -1,0 +1,16 @@
+[package]
+name = "docker-configuration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Daemon configuration model with validation and layered merge"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+docker-errors = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
