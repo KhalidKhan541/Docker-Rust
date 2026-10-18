@@ -1,0 +1,20 @@
+[package]
+name = "docker-logging"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Structured daemon logging plus container JSON-lines log driver model"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+docker-errors = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+
