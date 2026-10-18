@@ -1,0 +1,18 @@
+[package]
+name = "docker-container-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Container configuration, lifecycle state machine, and object store model"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+docker-errors = { workspace = true }
+docker-common = { workspace = true }
+docker-events = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
