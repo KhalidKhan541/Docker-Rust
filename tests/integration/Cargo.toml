@@ -1,0 +1,19 @@
+[package]
+name = "docker-rs-integration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cross-crate integration tests for the docker-rs workspace (Milestone A foundation)"
+
+[dependencies]
+docker-errors = { workspace = true }
+docker-common = { workspace = true }
+docker-configuration = { workspace = true }
+docker-logging = { workspace = true }
+docker-events = { workspace = true }
+docker-container-model = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
