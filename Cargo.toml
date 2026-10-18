@@ -1,0 +1,54 @@
+# docker-rs — Rust-native reimplementation of the Docker ecosystem
+#
+# Workspace root. Every implemented crate has a single, clearly documented
+# responsibility. See README.md and docs/ for reverse-engineering records.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/errors",
+    "crates/common",
+    "crates/configuration",
+    "crates/logging",
+    "crates/events",
+    "crates/container-model",
+    "tests/integration",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/local/docker-rs"
+
+[workspace.dependencies]
+# Internal crates — dependency direction is strictly acyclic:
+# container-model -> {common, errors, events}
+# configuration   -> {common, errors}
+# logging         -> {common, errors}
+# events          -> {common, errors, logging}
+docker-errors = { path = "crates/errors" }
+docker-common = { path = "crates/common" }
+docker-configuration = { path = "crates/configuration" }
+docker-logging = { path = "crates/logging" }
+docker-events = { path = "crates/events" }
+docker-container-model = { path = "crates/container-model" }
+
+# External dependencies, pinned at conservative major versions.
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "json", "local-time"] }
+chrono = { version = "0.4", features = ["serde"] }
+getrandom = "0.2"
+sha2 = "0.10"
+
+[profile.dev]
+# Binaries must stay small on this 4 GB host; debug info is not needed for
+# workspace-local tests.
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
