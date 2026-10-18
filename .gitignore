@@ -1,0 +1,15 @@
+# Build artifacts
+/target/
+crates/*/target/
+
+# Vendored upstream source trees (pinned revisions, preserved on disk, not
+# tracked by this repo — see docs/REVERSE_ENGINEERING.md for revision Pins)
+/upstream/
+
+# Locally installed MinGW binutils (tooling, not project code)
+/tools/mingw64/
+
+# Local scratch
+*.log
+*.tmp
+.env
