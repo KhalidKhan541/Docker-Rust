@@ -18,6 +18,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -161,6 +167,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "docker-image"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chrono",
+ "docker-common",
+ "docker-errors",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "docker-logging"
 version = "0.1.0"
 dependencies = [
@@ -182,7 +200,19 @@ dependencies = [
  "docker-container-model",
  "docker-errors",
  "docker-events",
+ "docker-image",
  "docker-logging",
+ "docker-storage",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "docker-storage"
+version = "0.1.0"
+dependencies = [
+ "docker-common",
+ "docker-errors",
  "serde_json",
  "tempfile",
 ]
