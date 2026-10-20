@@ -28,17 +28,36 @@ Types at `upstream/image-spec/specs-go/v1/`:
 `descriptor.go`, `config.go`, `manifest.go`, `index.go`, `layout.go`,
 `mediatype.go`, `annotations.go`.
 
-Implemented today:
+Implemented today (milestones A–B):
 
 - `Digest` (`algo:hex`, sha256-only validation window) — used by and
   producing `Descriptor.digest`-style strings.
 - `ImageRef` parsing aligns with the descriptor's reference grammar needs.
+- `Descriptor`/`Platform` (`docker-image`): camelCase keys verified verbatim
+  against the pinned Go tags; `data` embedded as base64 exactly like Go
+  `encoding/json` handles `[]byte`; upstream `DescriptorEmptyJSON` ported
+  (digest `sha256:44136fa3…caaff8a`, size 2, contents `{}`).
+- `Manifest`/`Index` with the embedded `Versioned` schema version:
+  skip-if-empty optional fields matching Go `omitempty`, and `validate()`
+  conformance checks (schemaVersion 2, config media type pinned,
+  indexed per-entry errors).
+- Image `Config` structs: both casing regimes pinned by tests — camelCase
+  manifest/index container fields vs PascalCase execution parameters
+  (`Env`, `Entrypoint`, `Cmd`, `ExposedPorts`/`Volumes` as
+  `map<K, {}>`, `WorkingDir`, `Labels`, `StopSignal`, `ArgsEscaped`);
+  `architecture`/`os` at top level (Go's embedding of `Platform`);
+  `config` always serialized (Go `omitempty` has no effect on structs).
+- `oci-layout` bundle layout (`docker-storage`): `oci-layout` marker bytes
+  `{"imageLayoutVersion":"1.0.0"}` verbatim; `blobs/sha256/<hex>`
+  content addressing where the store root IS an OCI blobs directory;
+  unsupported marker versions reject as `Unsupported`, never silently
+  reinterpret.
 
- Coming in milestone B/C (`docker-image`):
+Coming in milestone C (`docker-distribution`):
 
-- `Descriptor`, `(Image|Index)Manifest`, image `Config` structs, and the
-  `oci-layout` bundle layout (`layout.go`'s `ImageIndex` + layout markers),
-  stored content-addressed exactly like containerd's content store model.
+- Manifest push/pull content negotiation against the distribution-spec
+  media-type matrix; referrers/tag-schema indexing on top of the types
+  above.
 
 ## distribution-spec v1.1.1 — pinned `a139cc4231…`
 
