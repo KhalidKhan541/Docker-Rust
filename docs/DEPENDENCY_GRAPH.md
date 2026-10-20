@@ -2,17 +2,20 @@
 
 ## Rust workspace (current)
 
-Milestone A depends only on the crates below; the graph is acyclic and leaves
-target-specific code (`getrandom`, `std::process`) in `docker-common`.
+Milestones A–B depend only on the crates below; the graph is acyclic and
+leaves target-specific code (`getrandom`, `std::process`) in `docker-common`.
 
 ```
 docker-common  ←+← docker-configuration
                 |← docker-logging
                 |← docker-events
                 |← docker-container-model
+                |← docker-image                          (Digest in config diff_ids/descriptors)
+                |← docker-storage                        (Digest + rng for blob addressing)
 docker-errors  ←+← docker-configuration, docker-logging, docker-events,
-                    docker-container-model        (all depend on both roots)
-tests/integration (docker-rs-integration) → uses all six crates
+                    docker-container-model, docker-image, docker-storage
+                    (all middle-layer crates depend on both roots)
+tests/integration (docker-rs-integration) → uses all eight crates
 ```
 
 Crate-level rules enforced by review:
@@ -25,8 +28,10 @@ Crate-level rules enforced by review:
    integration crate.
 
 External dependencies (pinned in root `Cargo.toml`): `thiserror 2`, serde +
-serde_json (features `derive`), chrono (logging timestamps), tracing +
-tracing-subscriber (feature `local-time`), `getrandom 0.2` (IDs).
+serde_json (features `derive`), chrono (RFC 3339 image-config and logging
+timestamps), tracing + tracing-subscriber (feature `local-time`),
+`getrandom 0.2` (IDs), `base64 0.22` (descriptor `data` codec mirroring Go
+`encoding/json`), `sha2 0.10` (content addressing).
 
 ## Upstream (Go) dependency shape — abridged, verified layouts
 
