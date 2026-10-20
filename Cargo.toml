@@ -8,6 +8,8 @@ resolver = "2"
 members = [
     "crates/errors",
     "crates/common",
+    "crates/image",
+    "crates/storage",
     "crates/configuration",
     "crates/logging",
     "crates/events",
@@ -27,8 +29,12 @@ repository = "https://github.com/local/docker-rs"
 # configuration   -> {common, errors}
 # logging         -> {common, errors}
 # events          -> {common, errors, logging}
+# image           -> {common, errors}
+# storage         -> {common, errors}
 docker-errors = { path = "crates/errors" }
 docker-common = { path = "crates/common" }
+docker-image = { path = "crates/image" }
+docker-storage = { path = "crates/storage" }
 docker-configuration = { path = "crates/configuration" }
 docker-logging = { path = "crates/logging" }
 docker-events = { path = "crates/events" }
@@ -43,6 +49,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "json", "local-time"]
 chrono = { version = "0.4", features = ["serde"] }
 getrandom = "0.2"
 sha2 = "0.10"
+base64 = "0.22"
 
 [profile.dev]
 # Binaries must stay small on this 4 GB host; debug info is not needed for
