@@ -1,0 +1,19 @@
+[package]
+name = "docker-image"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OCI image-spec v1.1.1 wire types (descriptor, manifest, index, config) for docker-rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+docker-common = { workspace = true }
+docker-errors = { workspace = true }
+serde = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
