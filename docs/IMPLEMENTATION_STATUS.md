@@ -1,13 +1,13 @@
 # Implementation Status
 
-Snapshot: Milestone A complete and committed. Honest state of every layer.
+Snapshot: Milestones A–B complete and committed. Honest state of every layer.
 
 ## Milestone status
 
 | # | Milestone | Status | Evidence |
 |---|-----------|--------|----------|
 | A | Foundation (errors, primitives, config, logging, events, container model) | **done** | 83 tests green; fmt/clippy clean; crates listed below |
-| B | Image & content addressable store | not started | planned: `docker-image`, `docker-storage`; sources verified (`image-spec/specs-go/v1/`) |
+| B | Image & content addressable store | **done** | 114 tests green (31 new); fmt/clippy `-D warnings` clean; crates listed below |
 | C | Registry (distribution client) | not started | distribution-spec v1.1.1 text in `upstream/distribution-spec/spec.md` |
 | D | Daemon core (containerd-equivalent orchestration) | not started | moby daemon/container.go paths mapped in GO_TO_RUST_MAPPING.md |
 | E | OCI runtime (container execution) | not started | runc v1.5.2 libcontainer surface mapped; runtime-spec schemas present and pinned |
@@ -29,6 +29,19 @@ Snapshot: Milestone A complete and committed. Honest state of every layer.
 | `docker-container-model` | `LifecycleState` + transition table (upstream `container/state.go` shape); `ContainerConfig`/`HostConfig` validation suite; `ContainerStore` with id/name/prefix resolution and ambiguity errors |
 | `tests/integration` | cross-crate vertical slice |
 
+## Milestone B — what exists, file by file
+
+| Crate | Contents |
+|-------|----------|
+| `docker-image` | `mediatype.rs`: upstream media-type constant set. `descriptor.rs`: `Descriptor` (`mediaType`/`digest`/`size` required; `urls`/`annotations`/`platform`/`artifactType` skip-if-empty; `data` base64 via a Go `encoding/json` `[]byte` codec emulation) + `Platform` (`os.version`/`os.features` renames) + `Descriptor::empty_json()` (upstream `DescriptorEmptyJSON`: `{}` blob, digest `sha256:44136fa3…caaff8a`, size 2). `manifest.rs`/`index.rs`: camelCase structs with embedded `specs.Versioned` schemaVersion + `validate()` conformance checks (schema 2, config media type pinned to the image config type, indexed per-entry error messages). `config.rs`: `ImageConfig` PascalCase keys incl. `ExposedPorts`/`Volumes` as `map<String, EmptyObject>` with wire `{}` values, `ArgsEscaped` skip-if-false, `RootFS`, `History`, `Image` with top-level `architecture`/`os` (Go embedding shape) and always-serialized `config` key |
+| `docker-storage` | `BlobStore` CAS at `<root>/sha256/<hex>` (absolute-root check; temp-file+rename writes; `put_verified` rejects digest mismatch before touching disk; duplicate puts dedupe with cross-process corruption detection; `get`/`get_verified`/`stat`/`exists`/`delete`; strict `list` tolerating only dot-prefixed temp leftovers); `init_image_layout`/`check_image_layout` writing/validating the exact `oci-layout` marker bytes `{"imageLayoutVersion":"1.0.0"}` with version mismatch → `Unsupported` |
+| `tests/integration` | `image_content_vertical_slice.rs`: config compose → rejected wrong-digest put (nothing written) → verified CAS put/get/stat → manifest composition → `init_image_layout` export with `index.json` → reload and re-verify all blobs |
+
+Wire shapes are pinned by tests against `serde_json::Value` goldens (Go JSON
+tags verified verbatim in the pinned upstream tree), covering both casing
+regimes: camelCase descriptor/manifest/index fields and PascalCase image
+execution parameters.
+
 ## Toolchain (environment)
 
 - stable-x86_64-pc-windows-gnu; `tools/env.ps1` PATH preloader mandatory.
@@ -45,8 +58,11 @@ Snapshot: Milestone A complete and committed. Honest state of every layer.
 
 ## Honest gaps
 
-- No HTTP server, no execution, no images, no registry, no build yet —
-  Milestones B–L are untouched source work beyond the A-layer.
+- No HTTP server, no execution, no registry, no build yet — Milestones
+  C–L are untouched source work beyond the A/B layers.
 - Windows host has no container backend for differential-at-runtime tests
   (see TESTING.md constraints).
-- Store is not yet thread-safe (planned synchronous model in D).
+- Stores are not yet thread-safe (planned synchronous model in D).
+- `Descriptor::validate` checks required fields, non-negative size, and
+  embedded-data consistency; the broader §descriptor conformance matrix
+  (per-media-type restrictions) lands with the registry client in C.
