@@ -19,6 +19,17 @@ Rust implementation. Paths verified against the pinned commits in the root
 | `moby/daemon/logger/jsonfilelog/jsonfilelog.go`           | `crates/logging/src/lib.rs`               | `{"log","stream","time"}` wire shape; `JsonLinesDriver`. |
 | `moby/daemon/events/events.go`                            | `crates/events/src/lib.rs`                | Event wire casing `type/action/scope/time/timeNano`, uppercase `ID`; bounded broker (drop-oldest) vs upstream stream closure. |
 
+## Milestone B (implemented)
+
+| Upstream (Go)                                            | Rust                                     | Notes |
+|----------------------------------------------------------|------------------------------------------|-------|
+| `image-spec/specs-go/v1/mediatype.go`                    | `crates/image/src/mediatype.rs`          | Constant values verbatim; non-distributable types kept for round-tripping only. |
+| `image-spec/specs-go/v1/descriptor.go`                   | `crates/image/src/descriptor.rs`         | `Descriptor`/`Platform` JSON tags verbatim; `data` base64 = Go `encoding/json` `[]byte` codec; `DescriptorEmptyJSON` ported (constants + `{}` blob). |
+| `image-spec/specs-go/v1/manifest.go` + `specs-go/versioned.go` | `crates/image/src/manifest.rs`      | schemaVersion 2 embedded; `validate()` conformance suite. |
+| `image-spec/specs-go/v1/index.go` + `specs-go/versioned.go` | `crates/image/src/index.rs`           | Same shape as manifest with the `manifests` list. |
+| `image-spec/specs-go/v1/config.go`                       | `crates/image/src/config.rs`             | PascalCase execution parameters; `map[string]struct{}` → `EmptyObject` with `{}` wire values; Go embedding → top-level `architecture`/`os`; `RootFS`/`History`. |
+| `image-spec/specs-go/v1/layout.go`                       | `crates/storage/src/lib.rs`              | `ImageLayoutFile`/`ImageBlobsDir`/`ImageLayoutVersion` constants; `BlobStore` CAS is literally an OCI blobs directory; temp+rename atomic writes. |
+
 ## Planned mapping (later milestones; verified source anchors)
 
 | Upstream (Go) | To be replaced by | Milestone |
@@ -27,7 +38,6 @@ Rust implementation. Paths verified against the pinned commits in the root
 | `containerd/core/runtime` + `plugins/services` | gRPC service clients / server shims | D |
 | `runc/libcontainer/container.go` | `docker-runtime` (own OCI implementation; bundles of `runtime-spec/specs-go`) | E |
 | `runtime-spec/schema/*.json` | bundle validation tests | E |
-| `image-spec/specs-go/v1/*.go` | `docker-image` types + content-addressable store | B |
 | `distribution-spec/spec.md` endpoints | `docker-distribution` (push/pull client) | C |
 | `moby/api/common.go`, `api/server/server.go`, `api/server/middleware/version.go` | `docker-api` HTTP routing + version middleware | F/G |
 | `buildkit/frontend/dockerfile/dockerfile2llb/*.go` | `docker-buildkit` frontend (LLB-equivalent DAG in Rust) | H/I |
