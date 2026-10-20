@@ -1,0 +1,17 @@
+[package]
+name = "docker-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Content-addressed blob store and OCI image-layout bootstrap for docker-rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+docker-common = { workspace = true }
+docker-errors = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
