@@ -130,6 +130,23 @@ pub struct StateSnapshot {
     /// Signal that terminated the process, if the process did not exit
     /// normally (fatal signals reported by the runtime).
     pub error_signal: Option<String>,
+    /// Unix seconds when the container most recently started.
+    pub started_at: Option<i64>,
+    /// Unix seconds when the container most recently stopped.
+    pub finished_at: Option<i64>,
+}
+
+impl StateSnapshot {
+    /// Snapshot for a freshly created container.
+    pub fn created() -> Self {
+        Self {
+            status: LifecycleState::Created,
+            exit_code: None,
+            error_signal: None,
+            started_at: None,
+            finished_at: None,
+        }
+    }
 }
 
 /// Validate a state transition request and return the target state, or an

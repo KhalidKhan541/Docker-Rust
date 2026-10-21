@@ -19,6 +19,8 @@ use crate::state::StateSnapshot;
 pub struct ContainerRecord {
     pub id: ContainerId,
     pub name: Option<String>,
+    /// Unix seconds when the record was created.
+    pub created_at: i64,
     pub config: ContainerConfig,
     /// Host-side options are part of the record because restart policy and
     /// auto-remove are consulted on every exit, not only at start.
@@ -156,6 +158,7 @@ mod tests {
         ContainerRecord {
             id: id.clone(),
             name: Some(name.into()),
+            created_at: 1_700_000_000,
             config: ContainerConfig {
                 image: ImageRef::parse("alpine:latest").unwrap(),
                 entrypoint: vec!["/bin/sh".into()],
@@ -175,6 +178,8 @@ mod tests {
                 status: LifecycleState::Created,
                 exit_code: None,
                 error_signal: None,
+                started_at: None,
+                finished_at: None,
             },
             host_config: crate::config::HostConfig::default(),
         }
