@@ -9,12 +9,12 @@ toolchain):
 . E:\Docker-Rust\tools\env.ps1
 cargo test --workspace
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Current status (Milestone A complete): **83 tests, 0 failed** across the
-workspace; `cargo fmt --check` and `cargo clippy --workspace --all-targets`
-clean (zero warnings).
+Current status (Milestones A–C complete): **168 tests, 0 failed** across the
+workspace; `cargo fmt --check` and
+`cargo clippy --workspace --all-targets -- -D warnings` clean (zero warnings).
 
 ## Test inventory
 
@@ -23,10 +23,13 @@ clean (zero warnings).
 | docker-errors | 5 | classification → HTTP mapping, verbatim messages |
 | docker-common | 35 | ids, digest grammar (incl. serde to `algo:hex`), names, references (registry vs path detection, uppercase rules, tag/digest), safe paths, platform probes (Unsupported on this host is expected, asserted) |
 | docker-configuration | 7 | defaults, daemon.json kebab parse + unknown-key rejection, env layering, validation (ports, data roots, log levels) |
-| docker-logging | 8 | level mapping, json-file record shape, file rotate ceilings |
-| docker-events | 3 | wire casing, filters, bounded-drop behavior |
+| docker-logging | 3 | level mapping, json-file record shape, file rotate ceilings |
+| docker-events | 8 | wire casing, filters, bounded-drop behavior |
 | docker-container-model | 23 | state machine + lifecycle table, config validation (env, ports, labels, hosts, restart policy, cpu/mem, privileged gating), id/prefix resolution semantics (incl. ambiguity errors) |
-| docker-rs-integration | 2 | vertical-slice flows across crates (create→validate→store→resolve→events) |
+| docker-image | 17 | descriptor/manifest/index/config wire casing against `image-spec`, validation rules, empty-JSON descriptor hash |
+| docker-storage | 17 | CAS round-trip, streaming writes, dedupe, corruption detection, digest mismatch leaves nothing, OCI layout marker |
+| docker-distribution | 42 | URL parse/join/encoding, HTTP framing + limits + header/request-target injection guards, redirect credential stripping and downgrade refusal, RFC 7235 challenges, media-type negotiation, status→kind mapping |
+| docker-rs-integration | 11 | two foundation slices, image→CAS→layout, and the 8-test registry vertical slice against an in-process loopback registry |
 
 ## Principles
 
@@ -46,8 +49,8 @@ clean (zero warnings).
 
 | Milestone | Test addition |
 |-----------|---------------|
-| B (images) | image-spec conformance fixtures; content-addressed store round-trip; digest mismatch → `InvalidArgument` |
-| C (registry) | live distribution-spec client tests against a local pinned registry; TLS required; token auth |
+| B (images) | **done** — image-spec wire fixtures, CAS round-trip, digest mismatch → `InvalidArgument` |
+| C (registry) | **done** — in-process distribution-spec fixture (auth, push/pull, chunk resume, pagination, referrers); real registry binary differential deferred to L |
 | D (daemon core) | store concurrency stress; state-machine race simulators |
 | E (runtime) | runtime-spec schema validation of every emitted bundle; runc-equivalence matrix for same inputs; `Unsupported` honesty tests |
 | F/G (HTTP API) | Router tests from `moby/api/server` paths; version-gate matrix (`v1.24 … v1.51`, lower → structured rejection); events stream backpressure test |

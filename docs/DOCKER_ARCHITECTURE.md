@@ -83,11 +83,11 @@ Component responsibilities, as seen from the sources:
 | Logging (default driver)   | `docker-logging`                        | `moby/daemon/logger/jsonfilelog/`                    |
 | Event broker               | `docker-events`                         | `moby/daemon/events/events.go`                       |
 | Container model/store      | `docker-container-model`                | `moby/container/{state,memory_store,container}.go`   |
-| (next) Image/content store | planned `docker-image`, `docker-storage`| containerd `core/content`, `plugins/snapshots`       |
+| Image/content store        | `docker-image`, `docker-storage`         | image-spec v1.1.1 types; containerd `core/content`-style CAS        |
 | (next) Exec/runtime        | planned `docker-runtime`                | runc `libcontainer` (OCI runtime)                    |
 | (next) HTTP API            | planned `docker-api`                    | `moby/api/server`, `api/common.go` version gates     |
 | (next) Builder             | planned `docker-buildkit`               | buildkit `frontend/dockerfile/dockerfile2llb`        |
-| (next) Registry client     | planned `docker-distribution`           | distribution client (OCI dist spec v1.1.1)           |
+| Registry client            | `docker-distribution`                   | distribution-spec v1.1.1 client (pull/push/auth)     |
 | (next) CLI                 | planned `dockerrs` binary               | `cli/cmd/docker/`                                    |
 
 ## Design principles carried over from upstream

@@ -1,6 +1,6 @@
 # Implementation Status
 
-Snapshot: Milestones A–B complete and committed. Honest state of every layer.
+Snapshot: Milestones A–C complete and committed. Honest state of every layer.
 
 ## Milestone status
 
@@ -8,7 +8,7 @@ Snapshot: Milestones A–B complete and committed. Honest state of every layer.
 |---|-----------|--------|----------|
 | A | Foundation (errors, primitives, config, logging, events, container model) | **done** | 83 tests green; fmt/clippy clean; crates listed below |
 | B | Image & content addressable store | **done** | 114 tests green (31 new); fmt/clippy `-D warnings` clean; crates listed below |
-| C | Registry (distribution client) | not started | distribution-spec v1.1.1 text in `upstream/distribution-spec/spec.md` |
+| C | Registry (distribution client) | **done** | 168 tests green (42 distribution unit + 8 registry integration added); fmt/clippy `-D warnings` clean |
 | D | Daemon core (containerd-equivalent orchestration) | not started | moby daemon/container.go paths mapped in GO_TO_RUST_MAPPING.md |
 | E | OCI runtime (container execution) | not started | runc v1.5.2 libcontainer surface mapped; runtime-spec schemas present and pinned |
 | F/G | Engine HTTP API | not started | API_COMPATIBILITY.md plan; constants verified from `moby/api/common.go` |
@@ -42,6 +42,14 @@ tags verified verbatim in the pinned upstream tree), covering both casing
 regimes: camelCase descriptor/manifest/index fields and PascalCase image
 execution parameters.
 
+## Milestone C — what exists, file by file
+
+| Crate | Contents |
+|-------|----------|
+| `docker-distribution` | `url.rs`: absolute URL parser (scheme/host/port/IPv6, default-port normalization, dot-segment removal, query preservation), `join` resolution and query encoding. `http.rs`: synchronous HTTP/1.1 over `std::net::TcpStream`; `native-tls` for HTTPS (SChannel on this host); one request per connection (`Connection: close`); connect/read/write timeouts; Content-Length/chunked/EOF response bodies; head and body size ceilings; up to 5 redirects with cross-origin `Authorization`/`Cookie` stripping and HTTPS→HTTP downgrade rejection; request-header injection guards. `auth.rs`: RFC 7235 challenge parser (Bearer realm/service/scope, Basic, multiple challenges per header or across headers, quoted commas and escapes) + RFC 7617 Basic header. `client.rs`: `/v2/` ping; bearer challenge → token → retry with a per-scope token cache (30 s expiry margin, `token`/`access_token`); Basic-only registries and Basic credentials on the token endpoint; monolithic `POST`→`PUT` and chunked `PATCH` uploads (`Content-Range start-end`, `416` status query + resume capped at 2 restarts, `OCI-Chunk-Min-Length`, upload-`Location` rotation); manifest GET/PUT with content negotiation, body-digest and `Docker-Content-Digest` verification, schema 1 → `Unsupported`; blob `HEAD` presence/size; digest-verified pull streamed into `BlobStore`; tag listing with `Link: rel="next"` pagination (100-page cap, cycle detection); referrers API with tag-schema fallback and client-side `artifactType` filtering when `OCI-Filters-Applied` is absent; manifest/blob DELETE; registry error envelopes surfaced in classified messages; redirects to offloaded hosts carry no registry credentials. |
+| `docker-storage` | `BlobStore::put_stream`: hashes while writing to a temp file, verifies expected digest and size before atomic rename, removes the temp file on mismatch/read error, dedupes an existing blob, and detects store corruption; used by registry pulls so layers are never buffered whole in memory. |
+| `tests/integration` | `registry_vertical_slice.rs`: 8 tests against an in-process loopback HTTP registry — bearer token flow with caching, monolithic push (including second-push dedupe) + manifest PUT/GET + tags + byte-identical digest-verified pull + classified 404/405 failures + schema 1 rejection; cross-origin `307` redirect strips the bearer token; corrupted blob pull fails with `InvalidArgument` and leaves the store empty; chunked upload resumes after `416` and follows the status `Location`; `OCI-Chunk-Min-Length` raises the effective chunk size; tag pagination; referrers API filtering + tag-schema fallback; `403 DENIED` and repeated-`401` classification. |
+
 ## Toolchain (environment)
 
 - stable-x86_64-pc-windows-gnu; `tools/env.ps1` PATH preloader mandatory.
@@ -58,11 +66,19 @@ execution parameters.
 
 ## Honest gaps
 
-- No HTTP server, no execution, no registry, no build yet — Milestones
-  C–L are untouched source work beyond the A/B layers.
+- No HTTP server, no execution, no build yet — Milestones D–L are untouched
+  source work beyond the A–C layers.
+- Registry client: no cross-repository blob mount (every push does `HEAD`
+  and then a full upload), no single-`POST` monolithic upload (optional in
+  the spec), schema 1 manifests rejected rather than parsed, no Docker
+  config / credential-helper loading (callers provide Basic credentials), no
+  client certificates or pinned CA bundle (OS trust store via `native-tls`;
+  on Linux that pulls in OpenSSL and needs a C toolchain), and token caches
+  are in-memory only.
 - Windows host has no container backend for differential-at-runtime tests
   (see TESTING.md constraints).
 - Stores are not yet thread-safe (planned synchronous model in D).
 - `Descriptor::validate` checks required fields, non-negative size, and
-  embedded-data consistency; the broader §descriptor conformance matrix
-  (per-media-type restrictions) lands with the registry client in C.
+  embedded-data consistency; the broader §descriptor conformance matrix is
+  still planned, while the distribution client enforces protocol-level
+  media-type and digest rules at its own boundaries.

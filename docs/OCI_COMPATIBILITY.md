@@ -53,21 +53,42 @@ Implemented today (milestones A–B):
   unsupported marker versions reject as `Unsupported`, never silently
   reinterpret.
 
-Coming in milestone C (`docker-distribution`):
+Implemented in milestone C (`docker-distribution`):
 
-- Manifest push/pull content negotiation against the distribution-spec
-  media-type matrix; referrers/tag-schema indexing on top of the types
-  above.
+- Manifest/index push and pull under the content-negotiation matrix
+  (`DEFAULT_ACCEPT` prefers OCI index → OCI manifest → Docker manifest
+  list → Docker schema 2); manifest bodies are parsed into these types only
+  after the body digest and `Docker-Content-Digest` agree.
+- Referrers responses are parsed as `Index`; the tag-schema fallback reads
+  the `<algo>-<hex>` tag as an index and treats absence as "no referrers".
+- Schema 1 manifests are rejected as `Unsupported`, never reinterpreted.
 
 ## distribution-spec v1.1.1 — pinned `a139cc4231…`
 
-`upstream/distribution-spec/spec.md` (endpoints) and
-`content-negotiation.md` (accept-header rules) govern the registry client
-(milestone C): `HEAD/GET /v2/<name>/blobs|manifests`, `POST
-/v2/<name>/blobs/uploads/`, chunked + single-shot PUT semantics, challenge /
-token auth, and the manifest `Content-Type` matrix..digest tagging rules
-(`referrers` and tag-schema images) are part of the v1.1 contract the client
-will speak.
+Implemented by `docker-distribution` against `upstream/distribution-spec/
+spec.md` and `content-negotiation.md`:
+
+- Authentication: `WWW-Authenticate` challenge parsing (Bearer + Basic,
+  multiple header values), bearer token acquisition with service/scope and
+  a per-scope cache, Basic fallback for registries without a token service.
+- Blobs: `HEAD`/`GET /v2/<name>/blobs/<digest>` (pull streamed into the
+  CAS with digest + length verification), monolithic `POST`→`PUT`, chunked
+  `PATCH` with inclusive `Content-Range`, `416` resync through the upload
+  status endpoint, `OCI-Chunk-Min-Length`, and closing `PUT?digest=`.
+- Manifests: `GET`/`PUT /v2/<name>/manifests/<ref>` with the Accept
+  preference list, digest verification, and schema 1 rejection.
+- Discovery: tags `Link: rel="next"` pagination; referrers API plus the
+  spec's tag-schema fallback; `artifactType` filtering.
+- Management: manifest/blob `DELETE` (405 → `Unsupported`).
+- Errors: HTTP status plus the `{"errors":[...]}` envelope mapped onto
+  `docker-errors`.
+- Transport: one request per connection, at most five redirects,
+  cross-origin `Authorization`/`Cookie` stripping, HTTPS→HTTP downgrade
+  rejection.
+
+Known gaps: cross-repository blob mount, single-`POST` monolithic upload
+(optional in the spec), schema 1, and trust-root pinning (the OS trust
+store is used).
 
 ## Conformance harness plan
 
@@ -76,8 +97,9 @@ will speak.
    validate against the image-spec schema equivalents.
 2. Digest robustness: uppercase input normalized; non-sha256 → `Unsupported`
    (not unverified acceptance).
-3. Distribution client: live protocol tests against a pinned local registry
-   fixture in milestone C; no `latest` tag synthesis beyond spec.
+3. Distribution client: in-process loopback registry fixture implementing
+   the pinned spec text; a real registry binary differential is deferred to
+   milestone L.
 4. rea (binary RE MCP) checks the *shipped binaries* of upstream tools at
    behavioral level when our implementation reaches parity testing (see
    TESTING.md) — the spec text decides intent; REA is used for compiled

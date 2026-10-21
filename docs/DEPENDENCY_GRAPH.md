@@ -2,36 +2,41 @@
 
 ## Rust workspace (current)
 
-Milestones A–B depend only on the crates below; the graph is acyclic and
-leaves target-specific code (`getrandom`, `std::process`) in `docker-common`.
+Milestones A–C; the graph is acyclic and leaves target-specific code
+(`getrandom`, `std::net`, `std::process`) in `docker-common` and
+`docker-distribution`.
 
 ```
-docker-common  ←+← docker-configuration
-                |← docker-logging
-                |← docker-events
-                |← docker-container-model
-                |← docker-image                          (Digest in config diff_ids/descriptors)
-                |← docker-storage                        (Digest + rng for blob addressing)
-docker-errors  ←+← docker-configuration, docker-logging, docker-events,
-                    docker-container-model, docker-image, docker-storage
-                    (all middle-layer crates depend on both roots)
-tests/integration (docker-rs-integration) → uses all eight crates
+docker-errors  (workspace root)
+docker-common               → docker-errors
+docker-configuration        → docker-common, docker-errors
+docker-logging              → docker-common, docker-errors
+docker-events               → docker-common, docker-errors
+docker-container-model      → docker-common, docker-errors
+docker-image                → docker-common, docker-errors
+docker-storage              → docker-common, docker-errors
+docker-distribution         → docker-common, docker-errors, docker-image,
+                              docker-storage
+tests/integration           → all nine crates
 ```
 
 Crate-level rules enforced by review:
 
-1. `docker-errors` and `docker-common` never depend on each other or on
-   anything in the workspace (roots).
-2. Middle-layer crates may depend on both roots and nothing else.
-3. Integration tests may depend on everything.
-4. No `default` features-on features, no workspace crate depends on the
+1. `docker-errors` depends on no workspace crate (the only true root).
+2. `docker-common` depends only on `docker-errors`.
+3. Middle-layer crates depend on both roots. `docker-distribution` is the
+   only crate that composes other middle-layer crates (`docker-image` wire
+   types, `docker-storage` blob streaming); this introduces no cycle.
+4. Integration tests may depend on everything.
+5. No `default` features-on features, no workspace crate depends on the
    integration crate.
 
 External dependencies (pinned in root `Cargo.toml`): `thiserror 2`, serde +
 serde_json (features `derive`), chrono (RFC 3339 image-config and logging
 timestamps), tracing + tracing-subscriber (feature `local-time`),
 `getrandom 0.2` (IDs), `base64 0.22` (descriptor `data` codec mirroring Go
-`encoding/json`), `sha2 0.10` (content addressing).
+`encoding/json`), `sha2 0.10` (content addressing), `native-tls 0.2`
+(SChannel on Windows, OpenSSL on Linux).
 
 ## Upstream (Go) dependency shape — abridged, verified layouts
 
@@ -51,7 +56,8 @@ runc v1.5.2:
     libcontainer ──> runtime-spec/specs-go         (OCI config/state types)
 image-spec v1.1.1:
     specs-go/v1 (descriptor, config, manifest, index, layout, mediatype)
-distribution-spec v1.1.1: specification only (spec.md, content-negotiation.md)
+distribution-spec v1.1.1: specification only; docker-distribution implements
+    the client on top of the image-spec types and the blob store
 buildkit:
     frontend/dockerfile/frontend  ──> frontend/dockerfile/dockerfile2llb
       └──> llb (DAG) ──> solver ──> containerd content/snapshots

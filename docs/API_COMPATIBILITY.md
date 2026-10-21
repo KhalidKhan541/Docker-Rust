@@ -41,7 +41,9 @@ through `v1.51`, reject lower/unknown with a structured error, and set
    the store (`resolve()` semantics).
 3. `/events` (streaming; broker backpressure behavior documented in
    RUST_DESIGN.md) and `/logs` with the `follow`/`since`/`tail` matrix.
-4. `/images/*` (distribution + content store hooks, milestone C).
+4. `/images/*` (Engine handlers over the `docker-image`/`docker-storage`
+   layers and the milestone-C `docker-distribution` client; handlers land
+   with F/G).
 5. `/build` (buildkit frontend, milestone H/I).
 6. Exec + attach (hijacked streams) last — they need the runtime (E).
 

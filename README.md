@@ -7,7 +7,8 @@ Docker CLI, containerd, runc, and BuildKit with a modular Rust workspace
 that preserves compatibility with Docker Engine API semantics and the OCI
 specifications.
 
-**Project status: Milestone A (core foundation) — see
+**Project status: Milestones A–C complete (foundation, OCI image/content
+store, distribution client) — see
 [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).**
 
 ## Motivation and scope
@@ -33,18 +34,20 @@ Upstream revisions used for reverse engineering (pinned, preserved in
 
 Current milestone map:
 
-* **A — Core foundation** *(implemented)*: workspace, shared error
-  taxonomy (moby `errdefs` equivalent), typed IDs/references/digests,
-  platform capability probing, configuration layering, structured logging,
-  event model + broker, container model + lifecycle state machine,
-  integration tests.
-* **B — Container engine** *(next)*: Engine-API-shaped daemon endpoints,
-  container manager, image manager.
-* **C — Native runtime**: OCI runtime in Rust (libcontainer equivalent).
-* **D — Lifecycle & resources**, **E — image/content**, **F — storage &
-  snapshots**, **G — networking**, **H — CLI**, **I — build**, **J — Engine
-  API conformance**, **K — security/isolation**, **L — differential
-  testing**. See `docs/ROADMAP.md`.
+* **A — Foundation** *(implemented)*: workspace, shared error taxonomy
+  (moby `errdefs` equivalent), typed IDs/references/digests, platform
+  capability probing, configuration layering, structured logging, event
+  model + broker, container model + lifecycle state machine.
+* **B — Image & content store** *(implemented)*: OCI image-spec v1.1.1
+  types (descriptor/config/manifest/index/layout), content-addressed blob
+  store with verified writes, OCI layout export.
+* **C — Distribution client** *(implemented)*: distribution-spec v1.1.1
+  pull/push (monolithic + chunked with resume), bearer/basic auth, manifest
+  content negotiation, tag pagination, referrers with tag-schema fallback,
+  classified registry errors.
+* **D — Daemon orchestration core**, **E — OCI runtime**, **F/G — Engine
+  HTTP API**, **H/I — Builder**, **J — CLI**, **K — Security hardening**,
+  **L — Conformance & differential**: planned. See `docs/ROADMAP.md`.
 
 ## Supported operating systems
 
@@ -87,16 +90,20 @@ crates/
   logging/            daemon tracing init + container log entry json-file driver
   events/             engine event model + pub/sub broker (events.Message equiv)
   container-model/    create-request config, lifecycle state machine, store
+  image/              OCI image-spec types (descriptor, config, manifest, index)
+  storage/            content-addressed blob store + OCI layout marker
+  distribution/       distribution-spec v1.1.1 registry client (pull/push/auth)
 tests/
-  integration/        cross-crate integration tests (foundation slice)
+  integration/        cross-crate integration tests (A–C vertical slices)
 docs/                 reverse-engineering + design + status documents
 upstream/             pinned original repositories (not tracked in git)
 ```
 
 ## Runtime requirements
 
-* accomplishing Milestone A needs none beyond the toolchain;
-* Milestone C+ (native runtime) requires Linux kernel ≥ 5.8 facilities
+* accomplishing Milestones A–C needs none beyond the toolchain (the registry
+  client talks HTTP/1.1 + TLS over `std::net`);
+* Milestone E (native runtime) requires Linux kernel ≥ 5.8 facilities
   (namespaces, cgroup v2, overlayfs, veth/bridge), or an explicitly selected
   VM/WSL backend once implemented.
 

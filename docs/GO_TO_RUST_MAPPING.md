@@ -30,6 +30,19 @@ Rust implementation. Paths verified against the pinned commits in the root
 | `image-spec/specs-go/v1/config.go`                       | `crates/image/src/config.rs`             | PascalCase execution parameters; `map[string]struct{}` → `EmptyObject` with `{}` wire values; Go embedding → top-level `architecture`/`os`; `RootFS`/`History`. |
 | `image-spec/specs-go/v1/layout.go`                       | `crates/storage/src/lib.rs`              | `ImageLayoutFile`/`ImageBlobsDir`/`ImageLayoutVersion` constants; `BlobStore` CAS is literally an OCI blobs directory; temp+rename atomic writes. |
 
+## Milestone C (implemented)
+
+| Upstream (Go/spec)                                       | Rust                                     | Notes |
+|----------------------------------------------------------|------------------------------------------|-------|
+| `distribution-spec/spec.md` §Authentication               | `crates/distribution/src/auth.rs`, `client.rs` | RFC 7235 `WWW-Authenticate` parser (quoted commas, multiple challenges); bearer token endpoint with `service`/`scope`, per-scope cache with expiry margin; Basic registries and Basic credentials on the token endpoint; final 401 → `Unauthorized`. |
+| `distribution-spec/spec.md` blob upload/pull endpoints    | `crates/distribution/src/client.rs` (`push_blob_from_store`, `push_blob_chunked`, `pull_blob_to_store`, `head_blob`) | Monolithic `POST`→`PUT` and chunked `PATCH`; `Content-Range` `start-end` format; `416` → status `GET` + resume with `Location` rotation; `OCI-Chunk-Min-Length`; digest-verified streaming through `BlobStore`; second push skipped by `HEAD`. |
+| `distribution-spec/spec.md` manifest endpoints            | `client.rs` (`get_manifest`, `put_manifest`, `parse_manifest_document`) | Content-negotiated `Accept` list; body digest and `Docker-Content-Digest` verification; schema 1 → `Unsupported`; `application/json` sniffing per the negotiation table. |
+| `distribution-spec/spec.md` tag listing                   | `client.rs` (`list_tags`, `list_all_tags`, `parse_link_next`) | `Link: rel="next"` pagination, URL resolved against the registry origin, 100-page cap + repeat detection. |
+| `distribution-spec/spec.md` referrers                     | `client.rs` (`referrers`)                | API query with `artifactType`; `404` → `<algo>-<hex>` tag-schema fallback; client-side filtering unless `OCI-Filters-Applied` says the registry did it. |
+| `distribution-spec/spec.md` errors                        | `client.rs` (`status_error`, `registry_error_detail`) | HTTP status → `ErrorKind` (400/413/416 `InvalidArgument`, 401, 403, 404, 405 `Unsupported`, 409, 429 `Throttle`, 5xx `Unavailable`); registry `{"errors":[{code,message}]}` appended to messages. |
+| `distribution-spec/content-negotiation.md`                | `client.rs` (`DEFAULT_ACCEPT`)           | Preference order: OCI index, OCI manifest, Docker manifest list, Docker schema 2; OCI types preferred when serving. |
+| distribution transport rules in `spec.md`                 | `crates/distribution/src/http.rs`, `url.rs` | HTTP/1.1 over `TcpStream`; TLS via `native-tls`; one request per connection; ≤5 redirects; auth/cookie stripped cross-origin; HTTPS→HTTP rejected; size ceilings and header-injection guards. |
+
 ## Planned mapping (later milestones; verified source anchors)
 
 | Upstream (Go) | To be replaced by | Milestone |
@@ -38,7 +51,6 @@ Rust implementation. Paths verified against the pinned commits in the root
 | `containerd/core/runtime` + `plugins/services` | gRPC service clients / server shims | D |
 | `runc/libcontainer/container.go` | `docker-runtime` (own OCI implementation; bundles of `runtime-spec/specs-go`) | E |
 | `runtime-spec/schema/*.json` | bundle validation tests | E |
-| `distribution-spec/spec.md` endpoints | `docker-distribution` (push/pull client) | C |
 | `moby/api/common.go`, `api/server/server.go`, `api/server/middleware/version.go` | `docker-api` HTTP routing + version middleware | F/G |
 | `buildkit/frontend/dockerfile/dockerfile2llb/*.go` | `docker-buildkit` frontend (LLB-equivalent DAG in Rust) | H/I |
 | `cli/cmd/docker/docker.go` and subcommands | `dockerrs` CLI | J |

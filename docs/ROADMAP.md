@@ -9,19 +9,33 @@ primitives (id, digest, name, ref, safe path, platform, child-process
 scaffolding); container state machine + store; validation suite.
 Exit: workspace green (`cargo test` 83/83, fmt, clippy). **Met.**
 
-## B — Image & content store (`docker-image`)
+## B — Image & content store (`docker-image`, `docker-storage`) ✅ (complete)
 Port `image-spec/specs-go/v1` types (descriptor, config, manifest, index,
 layout); content-addressed blob store keyed by verified digest; layer
 extraction/apply on a `SafePath` root.
 Exit: full load/push-to-dir cycle with schema-validated manifests; digest
 mismatch = error; image inspection API types defined and unit-tested.
+**Met** (114 tests at the B snapshot).
 
-## C — Distribution client (`docker-distribution`)
+## C — Distribution client (`docker-distribution`) ✅ (complete)
 Implement distribution-spec v1.1.1 client: auth challenge/token, blob
 upload (single + chunked), manifest PUT/GET, tag listing under
-`content-negotiation.md` rules; TLS-first with pinned roots.
+`content-negotiation.md` rules; TLS-first.
 Exit: push/pull against a pinned local registry fixture round-trips
 byte-identical content; failure paths produce classified errors.
+**Met** — in-process loopback registry fixture implementing the pinned spec
+(8 integration tests); real-binary differential deferred to L. 168 workspace
+tests green.
+
+Implementation notes: Bearer challenge → token → retry with per-scope token
+caching, Basic registries and Basic credentials on the token endpoint;
+monolithic `POST`→`PUT` and chunked `PATCH` uploads with `416` range resync,
+status-`Location` rotation and `OCI-Chunk-Min-Length`; manifests verified
+against their computed digest (and `Docker-Content-Digest`); tags follow
+`Link: rel="next"`; referrers API plus the tag-schema fallback; schema 1 is
+an explicit `Unsupported` error. TLS uses the OS trust store via
+`native-tls` (SChannel here); redirect-following strips `Authorization`
+cross-origin and refuses HTTPS→HTTP downgrades.
 
 ## D — Daemon orchestration core
 Single-owner container store behind an actor; state machine drives
