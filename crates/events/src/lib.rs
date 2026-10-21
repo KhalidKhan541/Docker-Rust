@@ -12,8 +12,9 @@
 //! Exact casing is preserved — `/events` payloads use lowercase `type`,
 //! `action`, `scope`, while the nested `actor` carries an uppercase `"ID"`.
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{mpsc::RecvTimeoutError, Arc, Mutex};
+use std::time::Duration;
 
 use chrono::Utc;
 use docker_errors::{Error, Result};
@@ -48,6 +49,7 @@ impl EventType {
 
 /// Actions this engine emits natively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum KnownAction {
     Create,
     Destroy,
@@ -166,15 +168,17 @@ pub fn event_now(r#type: EventType, action: EventAction, actor: Actor) -> Event 
 /// only (upstream kills the event stream of slow listeners; docker-rs drops
 /// events — this difference and its reasons live in docs/API_COMPATIBILITY.md).
 /// Disconnected subscribers are pruned on publish.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct EventBroker {
     inner: Mutex<BrokerState>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct BrokerState {
     subs: Vec<Subscriber>,
     next_id: u64,
+    history: VecDeque<Event>,
+    history_capacity: usize,
 }
 
 #[derive(Debug)]
@@ -184,14 +188,50 @@ struct Subscriber {
 }
 
 const MAX_SUBSCRIBER_BUFFER: usize = 65536;
+/// Default replay window. The Engine API's `/events?since=` needs a bounded
+/// history; Moby keeps events for the lifetime of the daemon, but an
+/// unbounded in-memory history is not acceptable for a long-running engine.
+pub const DEFAULT_HISTORY_CAPACITY: usize = 4096;
+
+impl Default for EventBroker {
+    fn default() -> Self {
+        Self::with_history(DEFAULT_HISTORY_CAPACITY)
+    }
+}
 
 impl EventBroker {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Create a broker retaining at most `history_capacity` recent events.
+    pub fn with_history(history_capacity: usize) -> Self {
+        Self {
+            inner: Mutex::new(BrokerState {
+                subs: Vec::new(),
+                next_id: 0,
+                history: VecDeque::with_capacity(history_capacity.min(1024)),
+                history_capacity: history_capacity.max(1),
+            }),
+        }
+    }
+
     /// Register a subscription with a bounded buffer of `buffer` events.
     pub fn subscribe(self: &Arc<Self>, buffer: usize) -> Result<Subscription> {
+        self.subscribe_since(None, buffer)
+            .map(|(_, subscription)| subscription)
+    }
+
+    /// Register a subscription and atomically return the matching history.
+    ///
+    /// The history snapshot and subscriber registration happen under one
+    /// lock, so an event published concurrently is either in the snapshot or
+    /// delivered to the subscription, never lost between them.
+    pub fn subscribe_since(
+        self: &Arc<Self>,
+        since_nano: Option<i64>,
+        buffer: usize,
+    ) -> Result<(Vec<Event>, Subscription)> {
         if buffer == 0 || buffer > MAX_SUBSCRIBER_BUFFER {
             return Err(Error::invalid_argument(format!(
                 "subscribe buffer must be 1..={MAX}, got {buffer}",
@@ -200,14 +240,23 @@ impl EventBroker {
         }
         let (tx, rx) = std::sync::mpsc::sync_channel(buffer);
         let mut state = self.inner.lock().expect("event broker lock poisoned");
+        let replay = state
+            .history
+            .iter()
+            .filter(|event| since_nano.is_none_or(|since| event.time_nano >= since))
+            .cloned()
+            .collect();
         let id = state.next_id;
         state.next_id += 1;
         state.subs.push(Subscriber { id, tx });
-        Ok(Subscription {
-            rx,
-            id,
-            broker: Arc::clone(self),
-        })
+        Ok((
+            replay,
+            Subscription {
+                rx,
+                id,
+                broker: Arc::clone(self),
+            },
+        ))
     }
 
     /// Deliver an event to all connected, non-full subscribers. Returns how
@@ -215,6 +264,12 @@ impl EventBroker {
     pub fn publish(&self, event: Event) -> usize {
         let mut delivered = 0;
         let mut state = self.inner.lock().expect("event broker lock poisoned");
+        if state.history_capacity > 0 {
+            if state.history.len() == state.history_capacity {
+                state.history.pop_front();
+            }
+            state.history.push_back(event.clone());
+        }
         let mut dead: Vec<u64> = Vec::new();
         for sub in &state.subs {
             match sub.tx.try_send(event.clone()) {
@@ -235,6 +290,15 @@ impl EventBroker {
             .subs
             .len()
     }
+
+    /// Number of events currently retained for replay.
+    pub fn history_len(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("event broker lock poisoned")
+            .history
+            .len()
+    }
 }
 
 /// Receive handle for an EventBroker subscription.
@@ -253,6 +317,11 @@ impl Subscription {
 
     pub fn try_recv(&self) -> Option<Event> {
         self.rx.try_recv().ok()
+    }
+
+    /// Wait up to `timeout` for the next event.
+    pub fn recv_timeout(&self, timeout: Duration) -> std::result::Result<Event, RecvTimeoutError> {
+        self.rx.recv_timeout(timeout)
     }
 
     pub fn subscription_id(&self) -> u64 {
@@ -332,7 +401,7 @@ mod tests {
         let json = serde_json::to_value(&ev).unwrap();
         let obj = json.as_object().unwrap();
         assert!(obj.contains_key("type"), "lowercase type");
-        assert!(obj.contains_key("action"), "lowercase action");
+        assert_eq!(obj.get("action").unwrap(), "start", "lowercase action");
         assert!(obj.contains_key("timeNano"), "camelCase nanos");
         let wire_actor = obj.get("actor").unwrap().as_object().unwrap();
         assert!(wire_actor.contains_key("ID"), "uppercase ID in actor");
@@ -468,5 +537,52 @@ mod tests {
         let a = attrs::with_exit(attrs::container("id", "img", "n"), 137, Some("SIGKILL"));
         assert_eq!(a.attributes.get("exitCode").unwrap(), "137");
         assert_eq!(a.attributes.get("exitSignal").unwrap(), "SIGKILL");
+    }
+
+    #[test]
+    fn replay_returns_history_newer_than_since() {
+        let broker = Arc::new(EventBroker::new());
+        let mut first = event_now(
+            EventType::Container,
+            EventAction::Known(KnownAction::Create),
+            actor(),
+        );
+        first.time = 10;
+        first.time_nano = 10_000_000_000;
+        let mut second = first.clone();
+        second.action = EventAction::Known(KnownAction::Start);
+        second.time = 11;
+        second.time_nano = 11_000_000_000;
+        broker.publish(first);
+        broker.publish(second.clone());
+
+        let (replay, subscription) = broker.subscribe_since(Some(11_000_000_000), 8).unwrap();
+        assert_eq!(replay, vec![second.clone()]);
+        // The subscription is live after the snapshot.
+        broker.publish(second);
+        assert_eq!(
+            subscription.recv_blocking().unwrap().action,
+            EventAction::Known(KnownAction::Start)
+        );
+    }
+
+    #[test]
+    fn history_is_bounded() {
+        let broker = Arc::new(EventBroker::with_history(2));
+        for index in 0..5 {
+            let mut event = event_now(
+                EventType::Daemon,
+                EventAction::Known(KnownAction::Delete),
+                attrs::bare("x"),
+            );
+            event.time = index;
+            event.time_nano = index * 1_000_000_000;
+            broker.publish(event);
+        }
+        assert_eq!(broker.history_len(), 2);
+        let (replay, _) = broker.subscribe_since(None, 8).unwrap();
+        assert_eq!(replay.len(), 2);
+        assert_eq!(replay[0].time, 3);
+        assert_eq!(replay[1].time, 4);
     }
 }
