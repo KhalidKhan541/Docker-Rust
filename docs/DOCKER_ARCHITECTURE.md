@@ -35,8 +35,13 @@ Component responsibilities, as seen from the sources:
    constants live in `upstream/moby/api/common.go`:
    `DefaultVersion = "1.51"`, `MinSupportedAPIVersion = "1.24"`.
 3. **Engine daemon** — `upstream/moby/daemon/` orchestrates containers:
+   - `daemon/monitor.go` — consumes task exit events, deletes the containerd
+     task, records `die`, and hands the exit to the restart manager.
+   - `daemon/start.go`, `stop.go`, `kill.go`, `delete.go` — lifecycle
+     operations, deferred completion, and force-kill/remove timeouts.
+   - `restartmanager/restartmanager.go` — policy/backoff/cancellation.
    - `daemon/container.go`, `daemon/container_operations.go` — per-container
-     orchestration.
+     orchestration (networking/storage setup is not yet ported).
    - `daemon/names.go` — name format validation for containers/volumes/etc.
    - `daemon/events/events.go` — the event broker that customers subscribe to
      (`Events: type actor filters` API).
@@ -83,12 +88,42 @@ Component responsibilities, as seen from the sources:
 | Logging (default driver)   | `docker-logging`                        | `moby/daemon/logger/jsonfilelog/`                    |
 | Event broker               | `docker-events`                         | `moby/daemon/events/events.go`                       |
 | Container model/store      | `docker-container-model`                | `moby/container/{state,memory_store,container}.go`   |
+| Daemon lifecycle actor     | `docker-daemon`                         | `moby/daemon/{monitor,start,stop,kill,delete,events}.go`, `restartmanager/restartmanager.go` |
 | Image/content store        | `docker-image`, `docker-storage`         | image-spec v1.1.1 types; containerd `core/content`-style CAS        |
 | (next) Exec/runtime        | planned `docker-runtime`                | runc `libcontainer` (OCI runtime)                    |
 | (next) HTTP API            | planned `docker-api`                    | `moby/api/server`, `api/common.go` version gates     |
 | (next) Builder             | planned `docker-buildkit`               | buildkit `frontend/dockerfile/dockerfile2llb`        |
 | Registry client            | `docker-distribution`                   | distribution-spec v1.1.1 client (pull/push/auth)     |
 | (next) CLI                 | planned `dockerrs` binary               | `cli/cmd/docker/`                                    |
+
+## Daemon actor (Milestone D)
+
+Upstream protects each container with a mutex and lets API goroutines, the
+monitor goroutine, and the restart-manager goroutine race to update it.
+`docker-daemon` uses a stricter ownership model:
+
+```
+Daemon handle ──command+reply channel──> actor thread
+                                          ├─ ContainerStore (sole owner)
+                                          ├─ active RuntimeTask handles
+                                          ├─ restart deadlines
+                                          └─ pending stop/restart/remove replies
+monitor thread per task ──wait()──> delete task ──TaskExited──> actor
+```
+
+The actor loop blocks in `recv_timeout` until the next restart deadline or
+stop timer. A lifecycle command never returns a half-applied state: `stop`,
+`restart`, and forced `remove` keep their reply sender in a pending map and
+complete only after `TaskExited`. The actor then transitions the record
+through the central `docker-container-model` validator, emits the upstream
+event sequence (`kill`, `die`, `stop`, and optionally `start`/`restart` or
+`destroy`), and releases the caller.
+
+`Runtime`/`RuntimeTask` is the containerd-Task-equivalent seam
+(create/start/wait/kill/delete). Milestone D provides `SyntheticRuntime`, a
+deterministic first-class implementation used by every daemon test; Milestone
+E adds the OCI process implementation behind the same trait. There is no
+hidden fallback to Docker or containerd binaries.
 
 ## Design principles carried over from upstream
 
@@ -101,8 +136,8 @@ Component responsibilities, as seen from the sources:
   in `docker-container-model::state`.
 - **Events are best-effort for slow consumers.** Upstream closes/resets
   streams that cannot keep up; our bounded broker drops the oldest event and
-  reports it in the stream (documented divergence, chosen for drop-free
-  synchronization-free drops).
+  reports it in the stream (documented divergence, chosen so publishing never
+  blocks on a slow subscriber).
 - **Version gating is integral**: like `moby/api/server`, unsupported client
   API versions get a structured `versionUnsupported` error, not silent
   degradation.

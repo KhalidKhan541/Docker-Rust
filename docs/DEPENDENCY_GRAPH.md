@@ -2,9 +2,9 @@
 
 ## Rust workspace (current)
 
-Milestones A–C; the graph is acyclic and leaves target-specific code
-(`getrandom`, `std::net`, `std::process`) in `docker-common` and
-`docker-distribution`.
+Milestones A–D; the graph is acyclic and leaves target-specific code
+(`getrandom`, `std::net`, `std::process`) in `docker-common`,
+`docker-distribution`, and the `docker-daemon` runtime boundary.
 
 ```
 docker-errors  (workspace root)
@@ -17,16 +17,19 @@ docker-image                → docker-common, docker-errors
 docker-storage              → docker-common, docker-errors
 docker-distribution         → docker-common, docker-errors, docker-image,
                               docker-storage
-tests/integration           → all nine crates
+docker-daemon               → docker-common, docker-errors, docker-events,
+                              docker-container-model
+tests/integration           → all ten crates
 ```
 
 Crate-level rules enforced by review:
 
 1. `docker-errors` depends on no workspace crate (the only true root).
 2. `docker-common` depends only on `docker-errors`.
-3. Middle-layer crates depend on both roots. `docker-distribution` is the
-   only crate that composes other middle-layer crates (`docker-image` wire
-   types, `docker-storage` blob streaming); this introduces no cycle.
+3. Middle-layer crates depend on both roots. `docker-distribution` composes
+   `docker-image` wire types + `docker-storage` blob streaming; `docker-daemon`
+   composes `docker-events` + `docker-container-model` lifecycle state. Neither
+   introduces a cycle.
 4. Integration tests may depend on everything.
 5. No `default` features-on features, no workspace crate depends on the
    integration crate.
@@ -44,6 +47,7 @@ timestamps), tracing + tracing-subscriber (feature `local-time`),
 moby/api, moby/daemon ──> moby/errdefs            (error classification)
 moby/daemon ──> moby/container                    (container object)
 moby/container ──> moby/errdefs
+moby/daemon ──> moby/restartmanager               (policy/backoff)
 moby/daemon ──> containerd/client (vendored)      (gRPC to containerd)
 containerd v2.4.2:
     plugins/*  (content, snapshots, metadata, events, server, sandbox,

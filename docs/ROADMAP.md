@@ -37,13 +37,37 @@ an explicit `Unsupported` error. TLS uses the OS trust store via
 `native-tls` (SChannel here); redirect-following strips `Authorization`
 cross-origin and refuses HTTPS→HTTP downgrades.
 
-## D — Daemon orchestration core
-Single-owner container store behind an actor; state machine drives
-create→start→die transitions with events emitted at each step; restart
-policy engine; task supervision scaffolding equivalent to
-`moby/daemon/container.go` + `moby/container/monitor.go`.
-Exit: container lifecycle runs headlessly with synthetic runtime stub;
+## D — Daemon orchestration core (`docker-daemon`) ✅ (complete)
+Single-owner container store behind a command/reply actor; state machine
+drives create→start→die transitions with events emitted at each step;
+restart policy engine; task supervision equivalent to
+`moby/daemon/monitor.go` + `moby/restartmanager/restartmanager.go`.
+Exit: container lifecycle runs headlessly with the synthetic runtime;
 event stream reflects transitions; store stress tests pass.
+**Met** — 191 workspace tests green (9 daemon unit + 14 daemon integration
+added); fmt/clippy `-D warnings` clean.
+
+Implementation notes: one actor thread owns the `ContainerStore`, active
+tasks, restart timers, and pending API replies; command senders are the only
+public handle, so lifecycle transitions cannot interleave. Every started
+task gets a monitor thread blocked in `RuntimeTask::wait`; the monitor
+deletes the task and posts the exit back to the actor. Stop/restart/force-
+remove replies are deferred until `TaskExited`; stop escalates to SIGKILL
+after the configured grace period and fails honestly if the task still does
+not exit after 10 s. Restart scheduling ports Moby's manager: 100 ms initial
+delay, doubling to a 60 s cap, reset after a 10 s run, `no`/`always`/
+`unless-stopped`/`on-failure[:max]` semantics, and cancellation on manual
+stop/kill. Auto-remove fires only when no restart is scheduled, but not
+during a manual restart's intermediate stop. Events follow upstream ordering
+and attributes: `create`, `start`, `kill`, `die`, `stop`, `restart`,
+`destroy`; labels are merged first and `image`/`name` override, while `die`
+adds `exitCode`/`execDuration`.
+
+Milestone D scope limits, documented rather than hidden: no pause/unpause
+command, no HTTP surface, no persistence across daemon restart, no random
+name generation for unnamed creates, no negative (wait-forever) stop
+timeouts, and no real process execution — `SyntheticRuntime` is the only
+runtime implementation until E.
 
 ## E — OCI runtime (`docker-runtime`)
 Own OCI-bundle creation (runtime-spec 1.3.0 structures + schema

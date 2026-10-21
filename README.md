@@ -7,8 +7,8 @@ Docker CLI, containerd, runc, and BuildKit with a modular Rust workspace
 that preserves compatibility with Docker Engine API semantics and the OCI
 specifications.
 
-**Project status: Milestones A–C complete (foundation, OCI image/content
-store, distribution client) — see
+**Project status: Milestones A–D complete (foundation, OCI image/content
+store, distribution client, daemon orchestration core) — see
 [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).**
 
 ## Motivation and scope
@@ -45,9 +45,14 @@ Current milestone map:
   pull/push (monolithic + chunked with resume), bearer/basic auth, manifest
   content negotiation, tag pagination, referrers with tag-schema fallback,
   classified registry errors.
-* **D — Daemon orchestration core**, **E — OCI runtime**, **F/G — Engine
-  HTTP API**, **H/I — Builder**, **J — CLI**, **K — Security hardening**,
-  **L — Conformance & differential**: planned. See `docs/ROADMAP.md`.
+* **D — Daemon orchestration core** *(implemented)*: single-owner command
+  actor; create/start/stop/kill/restart/remove lifecycle; per-task monitor
+  threads; Moby restart-manager backoff and policy semantics; deferred
+  replies; auto-remove; `create`/`start`/`kill`/`die`/`stop`/`restart`/
+  `destroy` events; deterministic `SyntheticRuntime` for headless tests.
+* **E — OCI runtime**, **F/G — Engine HTTP API**, **H/I — Builder**,
+  **J — CLI**, **K — Security hardening**, **L — Conformance &
+  differential**: planned. See `docs/ROADMAP.md`.
 
 ## Supported operating systems
 
@@ -93,16 +98,19 @@ crates/
   image/              OCI image-spec types (descriptor, config, manifest, index)
   storage/            content-addressed blob store + OCI layout marker
   distribution/       distribution-spec v1.1.1 registry client (pull/push/auth)
+  daemon/             single-owner lifecycle actor, restart manager, runtime
+                      boundary, deterministic synthetic runtime
 tests/
-  integration/        cross-crate integration tests (A–C vertical slices)
+  integration/        cross-crate integration tests (A–D vertical slices)
 docs/                 reverse-engineering + design + status documents
 upstream/             pinned original repositories (not tracked in git)
 ```
 
 ## Runtime requirements
 
-* accomplishing Milestones A–C needs none beyond the toolchain (the registry
-  client talks HTTP/1.1 + TLS over `std::net`);
+* accomplishing Milestones A–D needs none beyond the toolchain (the registry
+  client talks HTTP/1.1 + TLS over `std::net`; Milestone D is exercised with
+  the in-process synthetic runtime and does not execute containers);
 * Milestone E (native runtime) requires Linux kernel ≥ 5.8 facilities
   (namespaces, cgroup v2, overlayfs, veth/bridge), or an explicitly selected
   VM/WSL backend once implemented.

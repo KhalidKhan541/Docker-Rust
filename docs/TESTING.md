@@ -12,7 +12,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Current status (Milestones A–C complete): **168 tests, 0 failed** across the
+Current status (Milestones A–D complete): **191 tests, 0 failed** across the
 workspace; `cargo fmt --check` and
 `cargo clippy --workspace --all-targets -- -D warnings` clean (zero warnings).
 
@@ -29,7 +29,8 @@ workspace; `cargo fmt --check` and
 | docker-image | 17 | descriptor/manifest/index/config wire casing against `image-spec`, validation rules, empty-JSON descriptor hash |
 | docker-storage | 17 | CAS round-trip, streaming writes, dedupe, corruption detection, digest mismatch leaves nothing, OCI layout marker |
 | docker-distribution | 42 | URL parse/join/encoding, HTTP framing + limits + header/request-target injection guards, redirect credential stripping and downgrade refusal, RFC 7235 challenges, media-type negotiation, status→kind mapping |
-| docker-rs-integration | 11 | two foundation slices, image→CAS→layout, and the 8-test registry vertical slice against an in-process loopback registry |
+| docker-daemon | 9 | restart policy/backoff/cap/reset/count/cancellation semantics, single-active-evaluation guard |
+| docker-rs-integration | 25 | two foundation slices, image→CAS→layout, the 8-test registry vertical slice, and the 14-test daemon slice (event order/attributes, escalation, retries, restart cancellation, force remove, auto-remove, validation, failure recovery, 8×10 stress) |
 
 ## Principles
 
@@ -51,7 +52,7 @@ workspace; `cargo fmt --check` and
 |-----------|---------------|
 | B (images) | **done** — image-spec wire fixtures, CAS round-trip, digest mismatch → `InvalidArgument` |
 | C (registry) | **done** — in-process distribution-spec fixture (auth, push/pull, chunk resume, pagination, referrers); real registry binary differential deferred to L |
-| D (daemon core) | store concurrency stress; state-machine race simulators |
+| D (daemon core) | **done** — synthetic-runtime lifecycle/event goldens, backoff and retry caps, stop escalation, restart cancellation, auto-remove, force remove, 8-thread lifecycle stress |
 | E (runtime) | runtime-spec schema validation of every emitted bundle; runc-equivalence matrix for same inputs; `Unsupported` honesty tests |
 | F/G (HTTP API) | Router tests from `moby/api/server` paths; version-gate matrix (`v1.24 … v1.51`, lower → structured rejection); events stream backpressure test |
 | H/I (build) | dockerfile2llb conversion ports with buildkit's own test vectors |

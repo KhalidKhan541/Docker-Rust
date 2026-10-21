@@ -43,12 +43,33 @@ Rust implementation. Paths verified against the pinned commits in the root
 | `distribution-spec/content-negotiation.md`                | `client.rs` (`DEFAULT_ACCEPT`)           | Preference order: OCI index, OCI manifest, Docker manifest list, Docker schema 2; OCI types preferred when serving. |
 | distribution transport rules in `spec.md`                 | `crates/distribution/src/http.rs`, `url.rs` | HTTP/1.1 over `TcpStream`; TLS via `native-tls`; one request per connection; ≤5 redirects; auth/cookie stripped cross-origin; HTTPS→HTTP rejected; size ceilings and header-injection guards. |
 
+## Milestone D (implemented)
+
+| Upstream (Go)                                            | Rust                                     | Notes |
+|----------------------------------------------------------|------------------------------------------|-------|
+| `moby/daemon/monitor.go` (`handleContainerExit`, `ProcessEvent`) | `crates/daemon/src/engine.rs` (`task_exited`, monitor threads) | One monitor thread per started task blocks in `RuntimeTask::wait`, deletes the task, then posts `TaskExited`. The actor computes `execDuration`, applies the restart decision, emits `die`, and sets `restarting` or `exited`. |
+| `moby/restartmanager/restartmanager.go`                  | `crates/daemon/src/restart.rs`            | Policy semantics, 100 ms initial delay, ×2 backoff, 60 s cap, reset at ≥10 s, restart-count cap for `on-failure`, cancellation, and single-active-evaluation guard. |
+| `moby/daemon/start.go` (`ContainerStart`, `containerStart`, `validateState`) | `engine.rs` (`start`, `start_task`) | Running/restarting → no-op (Moby keeps `Running` true during backoff and returns 304); paused → Conflict (unpause required); created/exited → create task, start it, spawn monitor, set `running`, emit `start`. Manual starts reset the manager and count. |
+| `moby/daemon/stop.go` (`ContainerStop`, `containerStop`) | `engine.rs` (`stop`, `begin_stop`, `send_stop_signal`, `handle_stop_timer`) | Sends `Config.StopSignal`, emits `kill`, waits for `TaskExited`, escalates to SIGKILL after the grace period, and emits `die` → `stop` before resolving the caller. A stop received during restart backoff cancels the timer and settles `exited`. |
+| `moby/daemon/kill.go` (`killWithSignal`, `Kill`)          | `engine.rs` (`kill`)                      | Emits `kill` with the numeric signal. Stop-signal/SIGKILL cancels an `always` restart; arbitrary signals set the manual-stop flag but may still restart under `always`, matching `ShouldRestart`. |
+| `moby/daemon/delete.go` (`ContainerRm`, force path)      | `engine.rs` (`remove`, `remove_record`)   | Non-force removal rejects running, paused, and restarting containers; force uses a 3 s stop timeout for live tasks, then `die`/`stop`/`destroy`; force-removing a restarting container cancels the pending timer and destroys it. |
+| `moby/daemon/events.go` (`LogContainerEventWithAttributes`) | `engine.rs` (`emit_container`, `container_actor`) | Labels are copied first, then `image` and `name` override; `die` adds `exitCode` and `execDuration`; actor id is the container id. |
+| `moby/container/container.go` (`ResetRestartManager`, `SetRunning`, `SetRestarting`, `SetStopped`) | `engine.rs` (`start_task`, `set_running`, `set_exit_state`, `set_dead`) | State writes go through the `docker-container-model` transition validator; manual start resets the restart count. |
+| containerd Task client (used by upstream `libcontainerd`) | `crates/daemon/src/runtime.rs` (`Runtime`, `RuntimeTask`) | Synchronous Rust seam equivalent to create/start/wait/kill/delete. Milestone E supplies the OCI implementation; D ships `SyntheticRuntime`. |
+
+Concurrency translation: upstream uses container mutexes plus goroutines
+(monitor, restart-manager timeout, API handlers). Docker-rs instead uses one
+actor thread for all state and per-task monitor threads only for `wait`.
+Deferred replies replace condition-variable waiters, so no caller observes a
+half-applied transition. This is a deliberate structural divergence; event
+order and policy semantics follow the Go sources.
+
 ## Planned mapping (later milestones; verified source anchors)
 
 | Upstream (Go) | To be replaced by | Milestone |
 |---------------|-------------------|-----------|
-| `moby/daemon/container.go`, `daemon/container_operations.go` | `docker-containerd` orchestration layer | D |
-| `containerd/core/runtime` + `plugins/services` | gRPC service clients / server shims | D |
+| `moby/daemon/container.go`, `daemon/container_operations.go` (networking/storage setup) | `docker-daemon` extensions | F/G |
+| `containerd/core/runtime` + `plugins/services` | gRPC service clients / server shims | E |
 | `runc/libcontainer/container.go` | `docker-runtime` (own OCI implementation; bundles of `runtime-spec/specs-go`) | E |
 | `runtime-spec/schema/*.json` | bundle validation tests | E |
 | `moby/api/common.go`, `api/server/server.go`, `api/server/middleware/version.go` | `docker-api` HTTP routing + version middleware | F/G |

@@ -38,10 +38,25 @@ reason each was chosen.
 
 ## Concurrency posture
 
-- Milestone A containers are pure state machines; the store is a single
-  struct with BTreeMap-backed prefix scans. **It is not yet thread-safe** —
-  the daemon will own exactly one store handle behind an async mutex /
-  actor in Milestone D, at which point the tests gain a stress module.
+- `ContainerStore` is a single struct with BTreeMap-backed prefix scans and
+  **no internal locking**. Milestone D gives it exactly one owner: the
+  `docker-daemon` actor thread. Public `Daemon` handles hold only a
+  `Mutex<Sender<Command>>` (for `Sync`) and every lifecycle call is a
+  command/reply round-trip, so there are no self-deadlocks and no torn
+  transitions.
+- The actor is deliberately synchronous: `std::sync::mpsc` plus
+  `recv_timeout` for the nearest restart/stop deadline. No Tokio, no async
+  mutex, no timer wheel. A single thread owns all container state; blocking
+  work must stay in runtime/monitor threads, not in the actor.
+- Each started container gets a monitor thread that blocks in
+  `RuntimeTask::wait`, deletes the task, and posts `TaskExited`. The actor
+  owns task handles and cancels stale generations by generation number.
+- Stop/restart/force-remove use deferred replies: the reply sender lives in a
+  pending map and is completed by `TaskExited` (or by an explicit error at
+  the 10 s hard timeout). Callers never poll.
+- `Runtime` and `RuntimeTask` are `Send + Sync`; Milestone E can swap in a
+  process-backed implementation without changing the actor. The synthetic
+  runtime is a testable production implementation, not a hidden mock.
 - Event broker is bounded (capacity 1024) and drop-oldest: never blocks,
   never panics on full, and surfaces drop counts to the subscriber stream
   (documented divergence from upstream's stream-closing behavior).
