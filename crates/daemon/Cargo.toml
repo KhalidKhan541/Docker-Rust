@@ -1,0 +1,17 @@
+[package]
+name = "docker-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Single-owner daemon orchestration core: lifecycle actor, restart policy, and task supervision"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+docker-errors = { workspace = true }
+docker-common = { workspace = true }
+docker-events = { workspace = true }
+docker-container-model = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }

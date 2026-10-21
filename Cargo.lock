@@ -157,6 +157,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "docker-daemon"
+version = "0.1.0"
+dependencies = [
+ "docker-common",
+ "docker-container-model",
+ "docker-errors",
+ "docker-events",
+ "serde",
+ "tracing",
+]
+
+[[package]]
 name = "docker-distribution"
 version = "0.1.0"
 dependencies = [
@@ -222,6 +234,7 @@ dependencies = [
  "docker-common",
  "docker-configuration",
  "docker-container-model",
+ "docker-daemon",
  "docker-distribution",
  "docker-errors",
  "docker-events",
