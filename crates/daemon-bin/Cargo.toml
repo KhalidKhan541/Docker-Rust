@@ -1,0 +1,23 @@
+[package]
+name = "docker-rsd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Run the docker-rs Engine HTTP API daemon"
+
+[[bin]]
+name = "docker-rsd"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+docker-api = { workspace = true }
+docker-configuration = { workspace = true }
+docker-daemon = { workspace = true }
+docker-errors = { workspace = true }
+docker-events = { workspace = true }
+docker-logging = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
