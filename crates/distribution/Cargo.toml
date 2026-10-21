@@ -1,0 +1,19 @@
+[package]
+name = "docker-distribution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OCI distribution-spec v1.1.1 registry client (pull/push, auth, content negotiation) for docker-rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+docker-common = { workspace = true }
+docker-errors = { workspace = true }
+docker-image = { workspace = true }
+docker-storage = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+native-tls = { workspace = true }

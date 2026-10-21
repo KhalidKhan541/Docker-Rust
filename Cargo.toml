@@ -10,6 +10,7 @@ members = [
     "crates/common",
     "crates/image",
     "crates/storage",
+    "crates/distribution",
     "crates/configuration",
     "crates/logging",
     "crates/events",
@@ -31,10 +32,12 @@ repository = "https://github.com/local/docker-rs"
 # events          -> {common, errors, logging}
 # image           -> {common, errors}
 # storage         -> {common, errors}
+# distribution    -> {common, errors, image, storage}
 docker-errors = { path = "crates/errors" }
 docker-common = { path = "crates/common" }
 docker-image = { path = "crates/image" }
 docker-storage = { path = "crates/storage" }
+docker-distribution = { path = "crates/distribution" }
 docker-configuration = { path = "crates/configuration" }
 docker-logging = { path = "crates/logging" }
 docker-events = { path = "crates/events" }
@@ -50,6 +53,7 @@ chrono = { version = "0.4", features = ["serde"] }
 getrandom = "0.2"
 sha2 = "0.10"
 base64 = "0.22"
+native-tls = "0.2"
 
 [profile.dev]
 # Binaries must stay small on this 4 GB host; debug info is not needed for
