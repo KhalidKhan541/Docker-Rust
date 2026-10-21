@@ -55,7 +55,7 @@ Rust implementation. Paths verified against the pinned commits in the root
 | `moby/daemon/delete.go` (`ContainerRm`, force path)      | `engine.rs` (`remove`, `remove_record`)   | Non-force removal rejects running, paused, and restarting containers; force uses a 3 s stop timeout for live tasks, then `die`/`stop`/`destroy`; force-removing a restarting container cancels the pending timer and destroys it. |
 | `moby/daemon/events.go` (`LogContainerEventWithAttributes`) | `engine.rs` (`emit_container`, `container_actor`) | Labels are copied first, then `image` and `name` override; `die` adds `exitCode` and `execDuration`; actor id is the container id. |
 | `moby/container/container.go` (`ResetRestartManager`, `SetRunning`, `SetRestarting`, `SetStopped`) | `engine.rs` (`start_task`, `set_running`, `set_exit_state`, `set_dead`) | State writes go through the `docker-container-model` transition validator; manual start resets the restart count. |
-| containerd Task client (used by upstream `libcontainerd`) | `crates/daemon/src/runtime.rs` (`Runtime`, `RuntimeTask`) | Synchronous Rust seam equivalent to create/start/wait/kill/delete. Milestone E supplies the OCI implementation; D ships `SyntheticRuntime`. |
+| containerd Task client (used by upstream `libcontainerd`) | `crates/runtime/src/task.rs` (`Runtime`, `RuntimeTask`), re-exported by `crates/daemon/src/runtime.rs` | Synchronous Rust seam equivalent to create/start/wait/kill/delete. E supplies `OciRuntime`; D ships `SyntheticRuntime`. |
 
 Concurrency translation: upstream uses container mutexes plus goroutines
 (monitor, restart-manager timeout, API handlers). Docker-rs instead uses one

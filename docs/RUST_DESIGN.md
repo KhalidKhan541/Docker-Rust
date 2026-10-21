@@ -54,9 +54,9 @@ reason each was chosen.
 - Stop/restart/force-remove use deferred replies: the reply sender lives in a
   pending map and is completed by `TaskExited` (or by an explicit error at
   the 10 s hard timeout). Callers never poll.
-- `Runtime` and `RuntimeTask` are `Send + Sync`; Milestone E can swap in a
-  process-backed implementation without changing the actor. The synthetic
-  runtime is a testable production implementation, not a hidden mock.
+- `Runtime` and `RuntimeTask` are `Send + Sync`; Milestone E added a
+  process-backed `OciRuntime` without changing the actor. The synthetic
+  runtime remains a testable production implementation, not a hidden mock.
 - Event broker is bounded (capacity 1024) and drop-oldest: never blocks,
   never panics on full, and surfaces drop counts to the subscriber stream
   (documented divergence from upstream's stream-closing behavior).

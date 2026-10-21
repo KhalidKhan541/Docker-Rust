@@ -69,14 +69,40 @@ name generation for unnamed creates, no negative (wait-forever) stop
 timeouts, and no real process execution — `SyntheticRuntime` is the only
 runtime implementation until E.
 
-## E — OCI runtime (`docker-runtime`)
+## E — OCI runtime (`docker-runtime`) — **portable layer complete; Linux execution compile-checked**
 Own OCI-bundle creation (runtime-spec 1.3.0 structures + schema
 validation of emitted JSON); execution via platform-appropriate process
 spawn; honest `Unsupported` for missing kernel features; attach/stdio
 plumbing.
-Exit: a container created from our model produces a schema-valid bundle
-and executes a real process on a supported host; on this Windows host the
-tests assert explicit `Unsupported` (not silent paths).
+
+Implemented:
+
+- Runtime-spec 1.3.0 Linux `Spec`/`State` types with strict unknown-field
+  handling and semantic validation.
+- `config.json` generation from `ContainerConfig`/`HostConfig`, including
+  Moby effective-argv and PATH/HOSTNAME/TERM merge behavior, namespace
+  selection, rootfs path/read-only, numeric user, and resources.
+- Bundles validated against the pinned schemas loaded directly from
+  `upstream/runtime-spec/schema/`.
+- `Runtime`/`RuntimeTask`/`RuntimeConfig` moved to `docker-runtime`; stdio
+  handle plumbing and cached exit status.
+- Windows/non-Linux `OciRuntime::create` returns an actionable
+  `Unsupported`.
+- Linux-only two-stage init helper: stage 1 creates namespaces/rootfs bind;
+  stage 2 is PID 1, mounts `/proc` in the correct PID namespace, applies
+  identity/`no_new_privs`, and `exec`s the process. Uses safe `nix` and
+  `signal-hook` APIs (`unsafe_code = "forbid"`).
+
+Exit criterion remains partially unmet: a real process has not been
+executed because this host is Windows with no Linux kernel/WSL/VM. The
+Linux target is installed and the backend passes `cargo check` and
+`cargo clippy -D warnings`. A Linux runner must execute the helper before
+this milestone can be marked complete.
+
+Known E limits: no rootfs extraction from the image store, cgroups,
+capability dropping, seccomp, LSM labels, user namespaces, TTY, additional
+mounts, hooks, devices, bridge networking, or custom rlimits. Each returns
+`Unsupported` rather than being ignored.
 
 ## F/G — Engine HTTP API (`docker-api`)
 Router + version middleware per `moby/api/common.go` gates; endpoints in

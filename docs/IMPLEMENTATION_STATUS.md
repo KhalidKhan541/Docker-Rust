@@ -1,6 +1,8 @@
 # Implementation Status
 
-Snapshot: Milestones A–D complete. Honest state of every layer.
+Snapshot: Milestones A–D complete; Milestone E portable layer complete and the
+Linux execution backend compile-checked but not runnable on this host. Honest
+state of every layer.
 
 ## Milestone status
 
@@ -10,7 +12,7 @@ Snapshot: Milestones A–D complete. Honest state of every layer.
 | B | Image & content addressable store | **done** | 114 tests green (31 new); fmt/clippy `-D warnings` clean; crates listed below |
 | C | Registry (distribution client) | **done** | 168 tests green (42 distribution unit + 8 registry integration added); fmt/clippy `-D warnings` clean |
 | D | Daemon core (containerd-equivalent orchestration) | **done** | 191 tests green (9 daemon unit + 14 daemon integration added); fmt/clippy `-D warnings` clean; actor + synthetic runtime |
-| E | OCI runtime (container execution) | not started | runc v1.5.2 libcontainer surface mapped; runtime-spec schemas present and pinned |
+| E | OCI runtime (container execution) | **in progress** | 220 tests green (25 runtime unit + 4 runtime integration tests added); fmt/clippy clean on Windows and `x86_64-unknown-linux-gnu`; bundle generation + deterministic Windows `Unsupported` tested; Linux init helper compile-checked, not executed on this Windows host |
 | F/G | Engine HTTP API | not started | API_COMPATIBILITY.md plan; constants verified from `moby/api/common.go` |
 | H/I | Builder (buildkit-equivalent) | not started | dockerfile2llb module verified in pinned tree |
 | J | CLI | not started | `upstream/cli/cmd/docker/` verified |
@@ -58,11 +60,28 @@ execution parameters.
 | `docker-container-model` | `ContainerRecord` now carries `HostConfig` so restart policy, stop timeout, and auto-remove remain available on every exit; `ContainerStore::get_mut` lets the single actor update state without removing/reinserting (stable ID index); `Signal::number()` supplies the POSIX integer used by kill events and `128+signal` exits. |
 | `tests/integration` | `daemon_vertical_slice.rs`: 14 tests covering create→start→stop event order and attributes, SIGTERM→SIGKILL escalation, `on-failure` retry cap, stop during restart backoff, non-forced removal during restart backoff, manual restart event ordering and count reset, `always` restart after an arbitrary signal but cancellation on stop, force remove, auto-remove after natural exit and after manual stop (without removing during restart), create validation/name conflicts, runtime start/create failures with retry, and an 8-thread × 10-container lifecycle stress test. |
 
+## Milestone E — what exists, file by file
+
+| Crate | Contents |
+|-------|----------|
+| `docker-runtime` | `spec.rs`: OCI runtime-spec 1.3.0 `Spec`/`Process`/`Root`/`Mount`/`Linux`/resource/state types with camelCase tags matching `specs-go`, omit-empty behavior, strict unknown-field rejection, and semantic checks (absolute container `cwd`, absolute mount destinations, unique namespaces, valid env entries, rlimit ordering; execution additionally requires mount, PID, IPC, and UTS namespaces and rejects `domainname`). `bundle.rs`: `spec_from_container` maps the Milestone D model to a schema-valid `config.json` — effective argv, Moby PATH/HOSTNAME/TERM environment merge, numeric UID[:GID], working dir, hostname (short ID default), mount/pid/ipc/uts (+ network unless host mode) namespaces, canonical rootfs path/read-only flag, memory/CPU/pids resources, image/network annotations; named/container networking, `extra_hosts`, and non-numeric users return `Unsupported`. `Bundle::create/open/write_config/remove` materializes and round-trips a bundle without overwriting an existing directory. `task.rs`: `Runtime`/`RuntimeTask`/`RuntimeConfig` (now with optional rootfs), `ExitStatus`, and optional stdio handles moved out of `docker-daemon` so the OCI and synthetic runtimes share one boundary. `oci/mod.rs`: `OciRuntime`, feature policy (`ensure_supported`) that rejects every unimplemented security-relevant field explicitly, and init-helper discovery (`DOCKER_RS_RUNTIME_INIT` override). `oci/unsupported.rs`: non-Linux hosts return an actionable `Unsupported`. |
+| `docker-runtime` (Linux) | `oci/linux.rs`: bundle creation plus task lifecycle (`start`/`wait`/`kill`/`delete`/`take_stdio`); helper process group, SIGKILL to the whole group, SIGTERM forwarding, cached exit status, one-waiter guard, and bundle cleanup. `init.rs` + `docker-runtime-init`: two-stage init. Stage 1 creates mount/UTS/IPC/PID (+ optional network) namespaces, private mount propagation, recursive rootfs bind, hostname, then forks stage 2 and forwards signals. Stage 2 is PID 1 in the new namespace; it chroots, mounts `/proc` in the correct PID namespace, remounts a read-only root, applies supplementary groups/GID/UID/`no_new_privs`, and `exec`s the container process. `nix` 0.30 safe APIs and `signal-hook` are used exclusively with `unsafe_code = "forbid"`. |
+| `docker-daemon` | `runtime.rs` now re-exports the shared boundary; `engine.rs` constructs `RuntimeConfig::new(...)` and otherwise keeps the Milestone D supervisor unchanged. |
+| `tests` | `crates/runtime/tests/schema.rs`: a draft-04 subset validator loads `config-schema.json`, `state-schema.json`, `defs*.json`, and `config-linux.json` directly from `upstream/runtime-spec/schema/`; generated bundle and state documents validate, and a negative test proves required-field detection. `runtime_windows.rs`: create on this host returns `Unsupported` naming Linux and the current OS. Bundle/model unit tests cover env merge order, default hostname, namespace mapping, resources, bridge annotation, numeric users, rootfs checks, round-trip, and conflict handling. |
+
+Exit status: the portable bundle/schema/validation half is complete. The Linux
+execution half is written and compile-checked for `x86_64-unknown-linux-gnu`,
+but this Windows host has no Linux kernel/WSL/VM, so a real process has not
+been executed here. That is the remaining E verification gap, not a claimed
+success.
+
 ## Toolchain (environment)
 
 - stable-x86_64-pc-windows-gnu; `tools/env.ps1` PATH preloader mandatory.
 - MSYS2 binutils 2.47 + runtime DLLs in `tools/mingw64` (gitignored) plus
   sysroot `self-contained` shim (as.exe copies) — fixed and reproducible.
+- `x86_64-unknown-linux-gnu` rust-std added for `cargo check`/`cargo clippy`
+  of the Linux-only runtime backend (no Linux linker or kernel is present).
 
 ## Reverse-engineering tooling
 
@@ -75,9 +94,26 @@ execution parameters.
 ## Honest gaps
 
 - Milestone D is a headless daemon core: no HTTP server, no container
-  execution, and no build yet. E–L remain source work beyond the A–D layers.
-- Daemon limitations kept explicit: `SyntheticRuntime` is the only runtime;
-  there is no pause/unpause, no persistence/reconnect across daemon restart,
+  execution, and no build yet. F–L remain source work beyond the A–E layers.
+- Milestone E's Linux backend has not been executed on this Windows host.
+  It is compile-checked only; treat runtime behavior as unverified until a
+  Linux host or VM runs the helper.
+- E execution limitations, all explicit errors rather than silent fallbacks:
+  no rootfs extraction/materialization from the image store (callers must
+  supply `RuntimeConfig::with_rootfs`); no cgroups (memory/CPU/pids limits
+  are accepted by the bundle builder but rejected by `ensure_supported`);
+  no capability dropping, seccomp, AppArmor/SELinux, user namespaces,
+  TTY/console allocation, additional mounts, hooks, devices, bridge
+  networking, or custom rlimits. Root in the container retains the helper's
+  initial-user-namespace capabilities, so this backend is not yet a security
+  boundary (Milestone K). `/proc` is mounted, but `/dev`, `/dev/pts`, `/sys`,
+  `/etc/hosts`, and `/etc/resolv.conf` are not; `none` networking leaves
+  loopback down; stop/delete uses the helper process group rather than a
+  cgroup, so a process that creates a new session can escape it.
+- Daemon limitations kept explicit: `SyntheticRuntime` remains the only
+  runtime wired into the actor; `OciRuntime` implements the same `Runtime`
+  trait but the image/rootfs layer that would supply it is not connected yet.
+  There is no pause/unpause, no persistence/reconnect across daemon restart,
   no auto-generated name for an unnamed create, and no negative
   (wait-forever) stop timeout. Start/stop on an already-running/stopped
   container return success without an event; the HTTP layer must translate

@@ -9,7 +9,12 @@ and how each is addressed at the current milestone.
    Addressed by the runtime layer (Milestone E; runc's
    `libcontainer/container.go` surface: namespaces, caps, seccomp, rootfs
    setup). Our runtime must produce `Unsupported` on anything it cannot
-   guarantee rather than a weaker fallback.
+   guarantee rather than a weaker fallback. Milestone E currently does
+   namespaces + chroot + UID/GID + `no_new_privs` on Linux, but **does not
+   drop capabilities or apply seccomp/LSM**, so it is not yet a hardened
+   boundary (Milestone K). It refuses user namespaces, custom capability
+   sets, seccomp profiles, LSM labels, mounts, devices, TTY, cgroups, and
+   bridge networking rather than ignoring them.
 2. **Privilege escalation via configuration** — `privileged`,
    `--user`, caps, mount sockets. Upstream gates these in HostConfig
    validation + daemon policy. Our `HostConfig::validate(allow_privileged)`
@@ -67,6 +72,9 @@ and how each is addressed at the current milestone.
 ## Review hooks for later milestones
 
 - Runtime (E): capability bounding sets, seccomp/no-seccomp honesty, userns.
+  **Current gap:** root in the container retains initial-user-namespace
+  capabilities; no capability drop exists yet. Tests must not describe the
+  E backend as secure isolation.
 - Network (H, after runtime): port-publish allowlists, no default
   `0.0.0.0` binding without explicit config.
 - Registry (C): TLS-only by default, referrers/tag-schema CC validation.

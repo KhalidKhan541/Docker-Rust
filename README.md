@@ -7,8 +7,9 @@ Docker CLI, containerd, runc, and BuildKit with a modular Rust workspace
 that preserves compatibility with Docker Engine API semantics and the OCI
 specifications.
 
-**Project status: Milestones A–D complete (foundation, OCI image/content
-store, distribution client, daemon orchestration core) — see
+**Project status: Milestones A–D complete; Milestone E portable OCI bundle
+layer complete, with the Linux execution backend compile-checked but not yet
+run on this Windows host — see
 [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).**
 
 ## Motivation and scope
@@ -50,7 +51,12 @@ Current milestone map:
   threads; Moby restart-manager backoff and policy semantics; deferred
   replies; auto-remove; `create`/`start`/`kill`/`die`/`stop`/`restart`/
   `destroy` events; deterministic `SyntheticRuntime` for headless tests.
-* **E — OCI runtime**, **F/G — Engine HTTP API**, **H/I — Builder**,
+* **E — OCI runtime** *(portable layer implemented; Linux execution
+  compile-checked)*: runtime-spec 1.3.0 types, model-to-bundle generation,
+  pinned-schema validation, shared runtime/task/stdio boundary, explicit
+  Windows `Unsupported`, and a Linux two-stage init helper. No real process
+  has been run on this Windows host.
+* **F/G — Engine HTTP API**, **H/I — Builder**,
   **J — CLI**, **K — Security hardening**, **L — Conformance &
   differential**: planned. See `docs/ROADMAP.md`.
 
@@ -82,6 +88,7 @@ cargo build --workspace          # build all crates
 cargo test --workspace           # unit + integration tests
 cargo fmt --all -- --check       # formatting check
 cargo clippy --workspace --all-targets -- -D warnings   # lints
+cargo check -p docker-runtime --target x86_64-unknown-linux-gnu  # Linux backend compile
 ```
 
 ## Repository layout
@@ -98,6 +105,8 @@ crates/
   image/              OCI image-spec types (descriptor, config, manifest, index)
   storage/            content-addressed blob store + OCI layout marker
   distribution/       distribution-spec v1.1.1 registry client (pull/push/auth)
+  runtime/            OCI 1.3 spec types, bundle builder, runtime/task boundary,
+                      Linux two-stage init, non-Linux Unsupported backend
   daemon/             single-owner lifecycle actor, restart manager, runtime
                       boundary, deterministic synthetic runtime
 tests/
@@ -111,16 +120,19 @@ upstream/             pinned original repositories (not tracked in git)
 * accomplishing Milestones A–D needs none beyond the toolchain (the registry
   client talks HTTP/1.1 + TLS over `std::net`; Milestone D is exercised with
   the in-process synthetic runtime and does not execute containers);
-* Milestone E (native runtime) requires Linux kernel ≥ 5.8 facilities
-  (namespaces, cgroup v2, overlayfs, veth/bridge), or an explicitly selected
-  VM/WSL backend once implemented.
+* Milestone E native execution requires a Linux host with namespaces, mount
+  privileges, and root (rootless/user namespaces are not implemented yet).
+  The code is compile-checked for `x86_64-unknown-linux-gnu`, but this
+  Windows host has no Linux kernel/WSL/VM to run it.
 
 ## Security limitations
 
 Containers are not a complete security boundary; see
 `docs/SECURITY_ANALYSIS.md` for the threat model inherited from the OCI
-stack and the explicit gaps (privileged mode refused, seccomp profiles,
-socket permissioning — tracked per milestone).
+stack and the explicit gaps. In particular, the current Linux runtime does
+not yet drop capabilities or apply seccomp/LSM policy, and bridge networking,
+cgroups, TTY, and user namespaces return `Unsupported`. Do not treat
+Milestone E as hardened isolation (Milestone K).
 
 ## License
 

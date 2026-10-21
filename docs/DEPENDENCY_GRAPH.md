@@ -2,9 +2,10 @@
 
 ## Rust workspace (current)
 
-Milestones A–D; the graph is acyclic and leaves target-specific code
-(`getrandom`, `std::net`, `std::process`) in `docker-common`,
-`docker-distribution`, and the `docker-daemon` runtime boundary.
+Milestones A–E; the graph is acyclic and leaves target-specific code
+(`getrandom`, `std::net`, `std::process`, Linux `nix`/`signal-hook`) in
+`docker-common`, `docker-distribution`, `docker-runtime`, and the daemon
+runtime boundary.
 
 ```
 docker-errors  (workspace root)
@@ -17,9 +18,11 @@ docker-image                → docker-common, docker-errors
 docker-storage              → docker-common, docker-errors
 docker-distribution         → docker-common, docker-errors, docker-image,
                               docker-storage
-docker-daemon               → docker-common, docker-errors, docker-events,
+docker-runtime              → docker-common, docker-errors,
                               docker-container-model
-tests/integration           → all ten crates
+docker-daemon               → docker-common, docker-errors, docker-events,
+                              docker-container-model, docker-runtime
+tests/integration           → all eleven crates
 ```
 
 Crate-level rules enforced by review:
@@ -27,9 +30,10 @@ Crate-level rules enforced by review:
 1. `docker-errors` depends on no workspace crate (the only true root).
 2. `docker-common` depends only on `docker-errors`.
 3. Middle-layer crates depend on both roots. `docker-distribution` composes
-   `docker-image` wire types + `docker-storage` blob streaming; `docker-daemon`
-   composes `docker-events` + `docker-container-model` lifecycle state. Neither
-   introduces a cycle.
+   `docker-image` wire types + `docker-storage` blob streaming;
+   `docker-runtime` composes `docker-container-model` with the OCI types;
+   `docker-daemon` composes `docker-events` + `docker-container-model` +
+   `docker-runtime` lifecycle contracts. None introduces a cycle.
 4. Integration tests may depend on everything.
 5. No `default` features-on features, no workspace crate depends on the
    integration crate.
@@ -39,7 +43,9 @@ serde_json (features `derive`), chrono (RFC 3339 image-config and logging
 timestamps), tracing + tracing-subscriber (feature `local-time`),
 `getrandom 0.2` (IDs), `base64 0.22` (descriptor `data` codec mirroring Go
 `encoding/json`), `sha2 0.10` (content addressing), `native-tls 0.2`
-(SChannel on Windows, OpenSSL on Linux).
+(SChannel on Windows, OpenSSL on Linux), and Linux-only `nix 0.30` +
+`signal-hook 0.3` for the OCI init helper. `regex 1` is a test-only dependency
+for the pinned JSON-schema validator.
 
 ## Upstream (Go) dependency shape — abridged, verified layouts
 
