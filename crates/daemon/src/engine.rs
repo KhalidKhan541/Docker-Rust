@@ -724,11 +724,11 @@ impl Engine {
             }
         }
 
-        let runtime_config = RuntimeConfig {
-            id: id.clone(),
-            config: record.config.clone(),
-            host_config: record.host_config.clone(),
-        };
+        let runtime_config = RuntimeConfig::new(
+            id.clone(),
+            record.config.clone(),
+            record.host_config.clone(),
+        );
         let task_box = self.runtime.create(&runtime_config)?;
         if let Err(error) = task_box.start() {
             let _ = task_box.delete();
