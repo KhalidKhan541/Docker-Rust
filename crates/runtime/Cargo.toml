@@ -1,0 +1,36 @@
+[package]
+name = "docker-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OCI 1.3 bundle generation and the daemon runtime/task boundary"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+docker-errors = { workspace = true }
+docker-common = { workspace = true }
+docker-container-model = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+signal-hook = "0.3"
+nix = { version = "0.30", default-features = false, features = [
+    "fs",
+    "hostname",
+    "mount",
+    "process",
+    "sched",
+    "signal",
+    "user",
+] }
+
+[dev-dependencies]
+regex = "1"
+tempfile = "3"
+
+[[bin]]
+name = "docker-runtime-init"
+path = "src/bin/docker-runtime-init.rs"

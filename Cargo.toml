@@ -15,6 +15,7 @@ members = [
     "crates/logging",
     "crates/events",
     "crates/container-model",
+    "crates/runtime",
     "crates/daemon",
     "tests/integration",
 ]
@@ -34,7 +35,8 @@ repository = "https://github.com/local/docker-rs"
 # image           -> {common, errors}
 # storage         -> {common, errors}
 # distribution    -> {common, errors, image, storage}
-# daemon          -> {common, errors, events, container-model}
+# runtime         -> {common, errors, container-model}
+# daemon          -> {common, errors, events, container-model, runtime}
 docker-errors = { path = "crates/errors" }
 docker-common = { path = "crates/common" }
 docker-image = { path = "crates/image" }
@@ -44,6 +46,7 @@ docker-configuration = { path = "crates/configuration" }
 docker-logging = { path = "crates/logging" }
 docker-events = { path = "crates/events" }
 docker-container-model = { path = "crates/container-model" }
+docker-runtime = { path = "crates/runtime" }
 docker-daemon = { path = "crates/daemon" }
 
 # External dependencies, pinned at conservative major versions.
