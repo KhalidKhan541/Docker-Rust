@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use docker_common::{ContainerId, Name};
 use docker_container_model::config::{ContainerConfig, HostConfig, Signal};
@@ -34,6 +34,13 @@ use crate::runtime::{ExitStatus, Runtime, RuntimeConfig, RuntimeTask};
 const FORCE_KILL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Moby hard-codes three seconds for force-remove (`daemon/delete.go`).
 const FORCE_REMOVE_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 /// Create-container request. `name` is optional like
 /// `POST /containers/create?name=...`; unnamed containers currently keep
@@ -71,6 +78,7 @@ impl CreateRequest {
 pub struct ContainerView {
     pub id: ContainerId,
     pub name: Option<String>,
+    pub created_at: i64,
     pub config: ContainerConfig,
     pub host_config: HostConfig,
     pub state: StateSnapshot,
@@ -82,6 +90,7 @@ impl ContainerView {
         Self {
             id: record.id.clone(),
             name: record.name.clone(),
+            created_at: record.created_at,
             config: record.config.clone(),
             host_config: record.host_config.clone(),
             state: record.state.clone(),
@@ -450,13 +459,10 @@ impl Engine {
         let record = ContainerRecord {
             id: id.clone(),
             name,
+            created_at: unix_now(),
             config: request.config,
             host_config: request.host_config,
-            state: StateSnapshot {
-                status: LifecycleState::Created,
-                exit_code: None,
-                error_signal: None,
-            },
+            state: StateSnapshot::created(),
         };
         let view = ContainerView::from_record(&record, 0);
         self.store.put(record.clone())?;
@@ -1157,6 +1163,8 @@ impl Engine {
             status: LifecycleState::Running,
             exit_code: None,
             error_signal: None,
+            started_at: Some(unix_now()),
+            finished_at: None,
         };
         Ok(())
     }
@@ -1172,16 +1180,20 @@ impl Engine {
         record.state.status = status;
         record.state.exit_code = Some(exit.exit_code);
         record.state.error_signal = exit.signal.map(|signal| signal.as_str().to_string());
+        record.state.finished_at = Some(unix_now());
         Ok(())
     }
 
     fn set_dead(&mut self, id: &ContainerId, exit: &ExitStatus) -> Result<()> {
         let record = self.store.get_mut(id)?;
         validate_transition(record.state.status, LifecycleState::Dead)?;
+        let started_at = record.state.started_at;
         record.state = StateSnapshot {
             status: LifecycleState::Dead,
             exit_code: Some(exit.exit_code),
             error_signal: exit.signal.map(|signal| signal.as_str().to_string()),
+            started_at,
+            finished_at: Some(unix_now()),
         };
         Ok(())
     }
