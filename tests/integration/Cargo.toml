@@ -14,6 +14,7 @@ docker-events = { workspace = true }
 docker-container-model = { workspace = true }
 docker-image = { workspace = true }
 docker-storage = { workspace = true }
+docker-distribution = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }
 
