@@ -1,0 +1,22 @@
+[package]
+name = "docker-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Docker Engine HTTP API over the docker-rs daemon actor"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+docker-common = { workspace = true }
+docker-errors = { workspace = true }
+docker-container-model = { workspace = true }
+docker-events = { workspace = true }
+docker-daemon = { workspace = true }
+chrono = { workspace = true }
+getrandom = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tiny_http = { workspace = true }
+tracing = { workspace = true }
