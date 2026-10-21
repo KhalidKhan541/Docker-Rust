@@ -12,6 +12,7 @@ docker-configuration = { workspace = true }
 docker-logging = { workspace = true }
 docker-events = { workspace = true }
 docker-container-model = { workspace = true }
+docker-daemon = { workspace = true }
 docker-image = { workspace = true }
 docker-storage = { workspace = true }
 docker-distribution = { workspace = true }
