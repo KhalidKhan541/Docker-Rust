@@ -32,27 +32,101 @@ through `v1.51`, reject lower/unknown with a structured error, and set
 | daemon.json | daemon `config.go` | `docker-configuration::FileConfig` kebab-case, deny_unknown_fields |
 | error payloads | `moby/errdefs/http_helpers.go` | `docker-errors::http_status()`; message text returned verbatim (no `status: ` prefix) |
 
-## HTTP endpoint plan (F/G) — endpoints, in dependency order
+## Implemented HTTP surface (Milestone F/G, first slice)
 
-1. `/_ping`, `GET /version`, `GET /info` (self-describe; version gate first)
-2. Container CRUD: `/containers/create`, `/containers/{id}/json` (inspect),
-   `?filters=` for `/containers/json`, `/start`, `/stop`, `/restart`, `/kill`
-   — all must accept **both** long ids and short prefixes resolved against
-   the store (`resolve()` semantics).
-3. `/events` (streaming; broker backpressure behavior documented in
-   RUST_DESIGN.md) and `/logs` with the `follow`/`since`/`tail` matrix.
-4. `/images/*` (Engine handlers over the `docker-image`/`docker-storage`
-   layers and the milestone-C `docker-distribution` client; handlers land
-   with F/G).
-5. `/build` (buildkit frontend, milestone H/I).
-6. Exec + attach (hijacked streams) last — they need the runtime (E).
+Every response (success or error) carries `Api-Version: 1.51`. Requests may
+use an unversioned path or a `v1.24`–`v1.51` prefix; the prefix is validated
+before routing. Errors use Moby's `{"message":"..."}` envelope with the
+`errdefs` status mapping.
 
-## Non-goals / honest gaps at this stage
+| Method | Path | Status |
+|--------|------|--------|
+| `GET`, `HEAD` | `/_ping` | implemented; `OK`, `Server`, `OSType`, `Swarm: inactive` |
+| `GET` | `/version` | implemented; advertises API `1.51`, minimum `1.24` |
+| `GET` | `/info` | implemented from live actor state; unsupported counters are zero and the synthetic-runtime warning is explicit |
+| `GET` | `/events` | implemented; history replay + live stream, `since`/`until`, type/container/event/label/scope filters |
+| `GET` | `/containers/json` | implemented; `all`, `limit`, status/id/name/label filters |
+| `POST` | `/containers/create` | implemented for the supported Config/HostConfig subset; optional `name`; generated name when absent |
+| `GET` | `/containers/{id}/json` | implemented; full id, unique prefix, or name |
+| `POST` | `/containers/{id}/start` | implemented; `204`, or Moby's `304` no-op |
+| `POST` | `/containers/{id}/stop` | implemented; `t` timeout, `204`, or `304` when already stopped |
+| `POST` | `/containers/{id}/restart` | implemented; `t` timeout |
+| `POST` | `/containers/{id}/kill` | implemented; signal name or number |
+| `POST`, `GET` | `/containers/{id}/wait` | implemented for `not-running`; returns `StatusCode`; `next-exit`/`removed` return 501 |
+| `DELETE` | `/containers/{id}` | implemented; `force` and `v` query parameters |
 
-- No HTTP is served yet; everything above is contract, not claim.
-- Hijacked upgrade (`application/vnd.docker.multiplexed-stream`) semantics
-  are specified but unimplemented.
-- Swarm endpoints (`/swarm/*`) are explicitly out of scope long-term —
-  docker-rs is a single-node engine. This will be stated in `/version`
-  responses once served (`("" swarm)` feature keys omitted), so clients see
-  a capability-honest v1.51 subset rather than broken 404s.
+Short-id and name resolution happen in the single-owner container store, so
+ambiguous prefixes produce the upstream-style conflict instead of selecting
+one arbitrarily.
+
+### Create compatibility
+
+The wire decoder accepts the field set emitted by the pinned Docker CLI
+(v29.9.1), including explicit zero values such as `MemorySwappiness: -1`,
+`PidsLimit: -1`, `ConsoleSize: [0,0]`, an empty `NetworkingConfig`, and empty
+log/port/mount maps. Non-zero values for features the runtime cannot honor
+are rejected with `Unsupported` (HTTP 501) rather than silently ignored.
+Examples: bind mounts, port bindings, privileged mode, extra hosts, TTY,
+non-default logging drivers, seccomp/AppArmor options, and resource limits.
+
+Smoke-tested against the real static Docker CLI: `docker version`,
+`docker create`, `docker run -d`, `docker ps`, `docker inspect`, `docker
+start`, `docker stop`, `docker kill`, `docker rm`, `docker wait`, and
+`docker events` all drive the daemon over TCP. `docker logs`, `attach`,
+`exec`, and foreground `docker run` correctly fail with an explicit
+`Unsupported` response until the runtime captures stdio.
+
+### Events
+
+`EventBroker` keeps a bounded replay window (4096 events by default). The
+history snapshot and subscriber registration are performed under one lock,
+so an event published during `subscribe_since` is either replayed or
+delivered live, never lost. `/events` writes newline-delimited JSON with
+Moby's lowercase `type`/`action`/`scope`, camelCase `timeNano`, and uppercase
+actor `ID`. A stream with neither `since` nor `until` starts at the current
+position; `until` alone replays the buffered window up to that time, matching
+Moby's zero-time rule. A slow subscriber is disconnected/dropped by the
+broker; the stream uses chunked transfer encoding.
+
+## Honest gaps in this slice
+
+- **No native image endpoints yet.** `/images/*` is not routed, so image
+  pull/list/inspect are still milestone F/G work. Container create currently
+  validates the reference syntax but does not require a materialized image.
+- **No process execution in the daemon binary.** `docker-rsd` wires the
+  synthetic runtime: lifecycle transitions and events are real, host PIDs are
+  zero, and no container process runs. The OCI backend exists and is
+  compile-checked but has no image-rootfs provider connected.
+- **No network plumbing.** `bridge`/`default` is accepted as the default
+  metadata value, `host` and `none` are accepted, but no bridge, veth, DNS,
+  port publishing, or named/container network setup occurs. Named and
+  `container:` network modes are rejected at create.
+- **No logs/attach/exec/stats/top/changes/export/archive/pause/update/rename/
+  resize.** Container subresources not listed above return HTTP 501 with a
+  `not implemented` message.
+- **No persistence.** Container records live only in the daemon actor's
+  memory; restarting `docker-rsd` loses them.
+- **Transport is TCP only.** `npipe://` and `unix://` listeners are rejected
+  explicitly by `docker-rsd`. Clients connect with
+  `DOCKER_HOST=tcp://127.0.0.1:2375`.
+- **No authentication or TLS.** The default listener binds loopback; do not
+  expose it to an untrusted network.
+- `/info` values that need image, network, cgroup, or kernel integrations are
+  zero/empty placeholders rather than invented data.
+- Hijacked upgrade streams
+  (`application/vnd.docker.multiplexed-stream`) are unimplemented.
+- Swarm endpoints are intentionally out of scope. `/info` reports
+  `Swarm.LocalNodeState=inactive`; `/version` does not advertise swarm
+  capability keys.
+
+## Upstream anchors for the implemented behavior
+
+- Version gate: `moby/api/common.go` (`DefaultVersion = "1.51"`,
+  `MinSupportedAPIVersion = "1.24"`) and
+  `moby/api/server/middleware/version.go`.
+- Start/stop `304` semantics: container start/stop handlers in
+  `moby/daemon/start.go` / `moby/daemon/stop.go`.
+- Wait conditions: `moby/api/types/container` and `moby/daemon/wait.go`.
+- Event wire shape: `moby/daemon/events/events.go`.
+- Filter vocabulary: `moby/api/types/filters` and daemon container list
+  filters.

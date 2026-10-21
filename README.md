@@ -9,8 +9,9 @@ specifications.
 
 **Project status: Milestones A–D complete; Milestone E portable OCI bundle
 layer complete, with the Linux execution backend compile-checked but not yet
-run on this Windows host — see
-[docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).**
+run on this Windows host; Milestone F/G has a runnable Docker-compatible
+container-lifecycle HTTP API, with image endpoints and native execution still
+pending — see [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).**
 
 ## Motivation and scope
 
@@ -56,9 +57,15 @@ Current milestone map:
   pinned-schema validation, shared runtime/task/stdio boundary, explicit
   Windows `Unsupported`, and a Linux two-stage init helper. No real process
   has been run on this Windows host.
-* **F/G — Engine HTTP API**, **H/I — Builder**,
-  **J — CLI**, **K — Security hardening**, **L — Conformance &
-  differential**: planned. See `docs/ROADMAP.md`.
+* **F/G — Engine HTTP API** *(container slice implemented; image endpoints
+  and real execution pending)*: Docker API `1.24`–`1.51` gate, `/_ping`,
+  `/version`, `/info`, container create/list/inspect/start/stop/restart/
+  kill/wait/delete, streaming `/events` with replay, and a runnable
+  `docker-rsd` binary. Tested with the real Docker CLI v29.9.1. The wired
+  runtime is synthetic: lifecycle state and events are real, but host
+  processes do not run yet.
+* **H/I — Builder**, **J — CLI**, **K — Security hardening**,
+  **L — Conformance & differential**: planned. See `docs/ROADMAP.md`.
 
 ## Supported operating systems
 
@@ -91,6 +98,31 @@ cargo clippy --workspace --all-targets -- -D warnings   # lints
 cargo check -p docker-runtime --target x86_64-unknown-linux-gnu  # Linux backend compile
 ```
 
+## Run the Engine API
+
+```bash
+cargo run -p docker-rsd -- --host 127.0.0.1:2375
+```
+
+In another terminal, point the official Docker CLI at the daemon:
+
+```bash
+export DOCKER_HOST=tcp://127.0.0.1:2375    # PowerShell: $env:DOCKER_HOST=...
+docker version
+docker run -d --name demo alpine:3.20 sleep 100
+docker ps
+docker inspect demo
+docker stop demo
+docker rm demo
+```
+
+The current daemon uses the **synthetic runtime**. Container lifecycle state,
+the API, and events are real; no host process is executed, so `docker logs`
+and foreground `docker run` return an explicit unsupported error. Do not
+expose the unauthenticated listener to an untrusted network. The runnable
+surface and remaining gaps are listed in
+[docs/API_COMPATIBILITY.md](docs/API_COMPATIBILITY.md).
+
 ## Repository layout
 
 ```
@@ -109,6 +141,8 @@ crates/
                       Linux two-stage init, non-Linux Unsupported backend
   daemon/             single-owner lifecycle actor, restart manager, runtime
                       boundary, deterministic synthetic runtime
+  api/                Docker Engine HTTP API (version gate, DTOs, routes, events)
+  daemon-bin/         `docker-rsd` runnable Engine API daemon
 tests/
   integration/        cross-crate integration tests (A–D vertical slices)
 docs/                 reverse-engineering + design + status documents
@@ -120,6 +154,8 @@ upstream/             pinned original repositories (not tracked in git)
 * accomplishing Milestones A–D needs none beyond the toolchain (the registry
   client talks HTTP/1.1 + TLS over `std::net`; Milestone D is exercised with
   the in-process synthetic runtime and does not execute containers);
+* the F/G container API (`docker-rsd`) likewise needs only the toolchain and
+  a free TCP port; it serves the synthetic runtime;
 * Milestone E native execution requires a Linux host with namespaces, mount
   privileges, and root (rootless/user namespaces are not implemented yet).
   The code is compile-checked for `x86_64-unknown-linux-gnu`, but this
@@ -132,7 +168,8 @@ Containers are not a complete security boundary; see
 stack and the explicit gaps. In particular, the current Linux runtime does
 not yet drop capabilities or apply seccomp/LSM policy, and bridge networking,
 cgroups, TTY, and user namespaces return `Unsupported`. Do not treat
-Milestone E as hardened isolation (Milestone K).
+Milestone E as hardened isolation (Milestone K). The F/G API listener is
+currently plain TCP with no authentication or TLS; keep it on loopback.
 
 ## License
 

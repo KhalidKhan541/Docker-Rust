@@ -14,11 +14,13 @@ cargo check -p docker-runtime --target x86_64-unknown-linux-gnu
 cargo clippy -p docker-runtime --target x86_64-unknown-linux-gnu --all-targets -- -D warnings
 ```
 
-Current status (Milestones A-D complete; E portable layer complete): **220
-tests, 0 failed** across the workspace; `cargo fmt --check` and clippy with
-`-D warnings` are clean on Windows, and the Linux-only runtime backend is
-clean under `cargo check`/`cargo clippy --target x86_64-unknown-linux-gnu`.
-The Linux helper has not been executed because this host has no Linux kernel.
+Current status (Milestones A–D complete; E portable layer complete; F/G
+container slice runnable): **251 tests, 0 failed** across the workspace;
+`cargo fmt --check` and clippy with `-D warnings` are clean on Windows, and
+the Linux-only runtime backend is clean under `cargo check`/`cargo clippy
+--target x86_64-unknown-linux-gnu`. The Linux helper has not been executed
+because this host has no Linux kernel. A manual smoke test with Docker CLI
+v29.9.1 (not part of the automated suite) exercised the HTTP daemon.
 
 ## Test inventory
 
@@ -28,12 +30,14 @@ The Linux helper has not been executed because this host has no Linux kernel.
 | docker-common | 35 | ids, digest grammar (incl. serde to `algo:hex`), names, references (registry vs path detection, uppercase rules, tag/digest), safe paths, platform probes (Unsupported on this host is expected, asserted) |
 | docker-configuration | 7 | defaults, daemon.json kebab parse + unknown-key rejection, env layering, validation (ports, data roots, log levels) |
 | docker-logging | 3 | level mapping, json-file record shape, file rotate ceilings |
-| docker-events | 8 | wire casing, filters, bounded-drop behavior |
+| docker-events | 10 | wire casing (incl. lowercase action), filters, bounded-drop behavior, bounded replay history, atomic replay-plus-subscribe |
 | docker-container-model | 23 | state machine + lifecycle table, config validation (env, ports, labels, hosts, restart policy, cpu/mem, privileged gating), id/prefix resolution semantics (incl. ambiguity errors) |
 | docker-image | 17 | descriptor/manifest/index/config wire casing against `image-spec`, validation rules, empty-JSON descriptor hash |
 | docker-storage | 17 | CAS round-trip, streaming writes, dedupe, corruption detection, digest mismatch leaves nothing, OCI layout marker |
 | docker-distribution | 42 | URL parse/join/encoding, HTTP framing + limits + header/request-target injection guards, redirect credential stripping and downgrade refusal, RFC 7235 challenges, media-type negotiation, status→kind mapping |
 | docker-daemon | 9 | restart policy/backoff/cap/reset/count/cancellation semantics, single-active-evaluation guard |
+| docker-api | 25 | API version parse/gate/messages and path prefixes; query booleans/timestamps/filters; DTO casing and rejection of unsupported runtime fields; signal parsing; event replay-cutoff rule; and 4 real-loopback HTTP tests covering system endpoints, CRUD/lifecycle/304/wait, generated names/short ids/filters/501s, and event replay/live streaming |
+| docker-rsd | 4 | CLI option parsing (inline/separate values, help/version), unknown/incomplete flag rejection, TCP-only listen-address handling including explicit named-pipe `Unsupported` |
 | docker-runtime | 29 | OCI 1.3 type round-trip/validation, model→bundle mapping (argv/env/user/namespaces/resources/hostname), bundle create/open/conflict/remove, `Unsupported` policy (TTY, bridge, missing PID namespace, cgroup resources, named users/hosts), pinned config/state schema validation, Windows create `Unsupported` |
 | docker-rs-integration | 25 | two foundation slices, image→CAS→layout, the 8-test registry vertical slice, and the 14-test daemon slice (event order/attributes, escalation, retries, restart cancellation, force remove, auto-remove, validation, failure recovery, 8×10 stress) |
 
@@ -59,7 +63,7 @@ The Linux helper has not been executed because this host has no Linux kernel.
 | C (registry) | **done** — in-process distribution-spec fixture (auth, push/pull, chunk resume, pagination, referrers); real registry binary differential deferred to L |
 | D (daemon core) | **done** — synthetic-runtime lifecycle/event goldens, backoff and retry caps, stop escalation, restart cancellation, auto-remove, force remove, 8-thread lifecycle stress |
 | E (runtime) | **portable layer done** — runtime-spec schema validation of emitted bundles/states loads the pinned schemas; bundle/model mapping and `Unsupported` honesty tests. **Pending:** execute a real process and run a runc-equivalence matrix on a Linux host. |
-| F/G (HTTP API) | Router tests from `moby/api/server` paths; version-gate matrix (`v1.24 … v1.51`, lower → structured rejection); events stream backpressure test |
+| F/G (HTTP API) | **container slice done** – real loopback HTTP tests for the version-gate matrix (`v1.24`–`v1.51`, lower → structured rejection), headers, CRUD/lifecycle/304/wait, filters, unsupported endpoints, and event replay/live streaming; manual Docker CLI v29.9.1 smoke. **Pending:** image endpoints, logs/attach/exec, and upstream router fixtures. |
 | H/I (build) | dockerfile2llb conversion ports with buildkit's own test vectors |
 | J (CLI) | CLI golden-output tests |
 | L (conformance) | Differential runs: docker-rs vs upstream binaries on identical inputs; diffed via event/log outputs. **rea MCP** (reverse-engineering toolchain; now connected and verified callable end-to-end) is used here on the compiled upstream artifacts (e.g. `dockerd.exe`, `runc.exe`) for error-path and behavior probing that text sources cannot show; any directives found *inside* analyzed binaries are treated as data, never followed. |

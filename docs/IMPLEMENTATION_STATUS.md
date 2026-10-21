@@ -1,8 +1,10 @@
 # Implementation Status
 
 Snapshot: Milestones A–D complete; Milestone E portable layer complete and the
-Linux execution backend compile-checked but not runnable on this host. Honest
-state of every layer.
+Linux execution backend compile-checked but not runnable on this host;
+Milestone F/G has a runnable container-lifecycle HTTP API and daemon binary,
+with image endpoints and real execution still pending. Honest state of every
+layer.
 
 ## Milestone status
 
@@ -13,7 +15,7 @@ state of every layer.
 | C | Registry (distribution client) | **done** | 168 tests green (42 distribution unit + 8 registry integration added); fmt/clippy `-D warnings` clean |
 | D | Daemon core (containerd-equivalent orchestration) | **done** | 191 tests green (9 daemon unit + 14 daemon integration added); fmt/clippy `-D warnings` clean; actor + synthetic runtime |
 | E | OCI runtime (container execution) | **in progress** | 220 tests green (25 runtime unit + 4 runtime integration tests added); fmt/clippy clean on Windows and `x86_64-unknown-linux-gnu`; bundle generation + deterministic Windows `Unsupported` tested; Linux init helper compile-checked, not executed on this Windows host |
-| F/G | Engine HTTP API | not started | API_COMPATIBILITY.md plan; constants verified from `moby/api/common.go` |
+| F/G | Engine HTTP API | **in progress — container slice runnable** | 251 workspace tests green (21 `docker-api` unit + 4 loopback HTTP integration + 4 `docker-rsd` unit); fmt/clippy `-D warnings` clean; real Docker CLI v29.9.1 smoke test over TCP; image endpoints and process execution pending |
 | H/I | Builder (buildkit-equivalent) | not started | dockerfile2llb module verified in pinned tree |
 | J | CLI | not started | `upstream/cli/cmd/docker/` verified |
 | K | Security hardening | not started | SECURITY_ANALYSIS.md review hooks defined |
@@ -75,6 +77,21 @@ but this Windows host has no Linux kernel/WSL/VM, so a real process has not
 been executed here. That is the remaining E verification gap, not a claimed
 success.
 
+## Milestone F/G — what exists, file by file
+
+| Crate | Contents |
+|-------|----------|
+| `docker-api` | `version.rs`: API `1.24`–`1.51` gate with upstream-compatible too-old/too-new messages and `/vX.Y` path-prefix parsing. `dto.rs`: explicit Moby-cased wire DTOs for version/info/create/list/inspect, conversion to the internal model, and rejection of non-empty unsupported fields. `query.rs`: query decoding with Docker boolean semantics, timestamp parsing, list/event filters (OR within a key, AND across keys), and explicit rejection of unimplemented filters. `server.rs`: synchronous `tiny_http` transport over the daemon actor; `/_ping`, `/version`, `/info`, container CRUD/lifecycle/wait, and `/events`; shared `Api-Version` headers and `{"message":...}` errors; Moby `304` start/stop semantics; chunked live event streaming. |
+| `docker-rsd` | Runnable daemon binary. Resolves `daemon.json`-style config and `DRC_*` environment overrides, initializes tracing, constructs the broker/synthetic runtime/actor, and serves the API on `--host` (default loopback `127.0.0.1:2375`). It deliberately rejects non-synthetic runtimes until a rootfs provider is connected, and rejects `npipe://`/`unix://` instead of pretending they work. |
+| `docker-events` | Bounded replay history (4096 events by default), atomic history-snapshot + subscribe (`subscribe_since`), `history_len`, `recv_timeout`, and lowercase action serialization matching Moby's wire JSON. |
+| `docker-container-model` / `docker-daemon` | `created_at` on records and `started_at`/`finished_at` on state snapshots, populated by actor lifecycle transitions and exposed through inspect/list. |
+| Tests | `crates/api/tests/http_api.rs`: a real loopback TCP client (Content-Length and chunked decoding) exercises version gates/headers, create/list/inspect/start/stop/restart/kill/wait/delete, generated names, short ids, filters, unsupported fields/endpoints, and event replay/live streaming. `docker-rsd` unit tests cover option parsing and explicit named-pipe rejection. Manual differential smoke test used the pinned Docker CLI v29.9.1 against `docker-rsd`. |
+
+What the real Docker CLI successfully exercised over
+`DOCKER_HOST=tcp://127.0.0.1:<port>`: `version`, `info`, `create`, `run -d`,
+`ps`, `inspect`, `start`, `stop`, `kill`, `rm`, `wait`, and `events`.
+`logs` fails with the explicit 501 unsupported message, as expected.
+
 ## Toolchain (environment)
 
 - stable-x86_64-pc-windows-gnu; `tools/env.ps1` PATH preloader mandatory.
@@ -93,8 +110,22 @@ success.
 
 ## Honest gaps
 
-- Milestone D is a headless daemon core: no HTTP server, no container
-  execution, and no build yet. F–L remain source work beyond the A–E layers.
+- Milestone F/G currently covers the container/system slice, not the full
+  Engine API. No image, network, volume, build, plugin, or swarm endpoints
+  are routed. Container create does not require a materialized image, and
+  no code path has yet materialized an image rootfs for execution.
+- `docker-rsd` serves the synthetic runtime. HTTP lifecycle behavior and
+  events are real, but no host process runs, `State.Pid` is zero, and logs
+  cannot exist. Foreground `docker run`/`docker attach` is therefore not
+  functional; detached lifecycle operations are.
+- The HTTP listener is TCP-only, unauthenticated, and unencrypted. The
+  default is loopback; exposing it is unsafe. Unix sockets and Windows named
+  pipes are rejected as `Unsupported`.
+- Container state is not persisted across `docker-rsd` restarts.
+- F/G API gaps, all explicit rather than silent: no `/logs`, attach, exec,
+  stats, top, changes, export, archive, pause/unpause, update, rename, or
+  resize; those subresources return 501. Image and other un-routed paths
+  return 404. Hijacked multiplexed streams are not implemented.
 - Milestone E's Linux backend has not been executed on this Windows host.
   It is compile-checked only; treat runtime behavior as unverified until a
   Linux host or VM runs the helper.
@@ -110,14 +141,13 @@ success.
   `/etc/hosts`, and `/etc/resolv.conf` are not; `none` networking leaves
   loopback down; stop/delete uses the helper process group rather than a
   cgroup, so a process that creates a new session can escape it.
-- Daemon limitations kept explicit: `SyntheticRuntime` remains the only
-  runtime wired into the actor; `OciRuntime` implements the same `Runtime`
-  trait but the image/rootfs layer that would supply it is not connected yet.
+- Daemon limitations kept explicit: `SyntheticRuntime` is the only runtime
+  wired into `docker-rsd`; `OciRuntime` implements the same `Runtime` trait
+  but the image/rootfs layer that would supply it is not connected yet.
   There is no pause/unpause, no persistence/reconnect across daemon restart,
-  no auto-generated name for an unnamed create, and no negative
-  (wait-forever) stop timeout. Start/stop on an already-running/stopped
-  container return success without an event; the HTTP layer must translate
-  those into upstream's 304 Not Modified response in F/G.
+  and no negative (wait-forever) stop timeout. Start/stop no-ops are now
+  translated to upstream's 304 by the HTTP layer, and unnamed API creates
+  receive a generated `docker-rs_<12-hex>` name.
 - Registry client: no cross-repository blob mount (every push does `HEAD`
   and then a full upload), no single-`POST` monolithic upload (optional in
   the spec), schema 1 manifests rejected rather than parsed, no Docker

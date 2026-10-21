@@ -104,13 +104,28 @@ capability dropping, seccomp, LSM labels, user namespaces, TTY, additional
 mounts, hooks, devices, bridge networking, or custom rlimits. Each returns
 `Unsupported` rather than being ignored.
 
-## F/G — Engine HTTP API (`docker-api`)
+## F/G — Engine HTTP API (`docker-api`) — **container slice runnable**
 Router + version middleware per `moby/api/common.go` gates; endpoints in
 API_COMPATIBILITY.md order; streaming (`/events`, `/logs`) with
 backpressure; hijack for exec/attach after E.
-Exit: CLI-equivalent clients (curl) operate containers through HTTP;
-version-gate matrix tests green; error payloads byte-match upstream
-message conventions.
+
+Implemented: API 1.24–1.51 gate and `/vX.Y` prefixes; `/_ping`, `/version`,
+`/info`; container create/list/inspect/start/stop/restart/kill/wait/remove
+with names and short ids; 304 start/stop semantics; list filters; `/events`
+history replay + live stream; Docker-cased DTOs with explicit rejection of
+unsupported fields; synchronous `tiny_http` transport; runnable `docker-rsd`
+binary over TCP. Verified with curl-level integration tests and a manual
+Docker CLI v29.9.1 smoke test.
+
+Still pending: `/images/*` (pull/list/inspect/delete) over the existing
+image/distribution layers, `/logs`, attach/exec hijack, stats/top, network
+and volume endpoints, image-rootfs materialization, and native execution in
+the daemon binary. Container state is in-memory only.
+
+Exit criterion partially met: curl/Docker-CLI container lifecycle works over
+HTTP, the version-gate matrix is green, and error payloads use upstream
+message conventions. Full endpoint and error-payload conformance is
+milestone L.
 
 ## H/I — Builder (`docker-buildkit`)
 Dockerfile frontend: instruction parsing → DAG (LLB-equivalent) →
