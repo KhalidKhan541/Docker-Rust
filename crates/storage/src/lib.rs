@@ -17,10 +17,12 @@
 //!   leftovers from a crashed write) are store corruption.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use docker_common::{rng, Digest};
 use docker_errors::{Error, Result};
+use sha2::Digest as _;
 
 /// File name of the layout marker (upstream `ImageLayoutFile`).
 pub const IMAGE_LAYOUT_FILE: &str = "oci-layout";
@@ -109,6 +111,98 @@ impl BlobStore {
         self.put(data)
     }
 
+    /// Stream `reader` into the store while hashing. The temp file is
+    /// removed on any failure, so a rejected stream never leaves content
+    /// behind. `expected` and `expected_size` are verified before the blob
+    /// is committed (rename), mirroring [`BlobStore::put_verified`].
+    ///
+    /// This is the path registry pulls use: layer bytes are never buffered
+    /// whole in memory.
+    pub fn put_stream(
+        &self,
+        expected: Option<&Digest>,
+        expected_size: Option<u64>,
+        reader: &mut dyn Read,
+    ) -> Result<(Digest, u64)> {
+        let tmp = self
+            .root
+            .join("sha256")
+            .join(format!(".tmp-{}", rng::random_hex(24)?));
+        let mut file = fs::File::create(&tmp)?;
+        let mut hasher = sha2::Sha256::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut total: u64 = 0;
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(e.into());
+                }
+            };
+            sha2::Digest::update(&mut hasher, &buf[..n]);
+            if let Err(e) = std::io::Write::write_all(&mut file, &buf[..n]) {
+                let _ = fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+            total += n as u64;
+        }
+        if let Err(e) = file.sync_all() {
+            drop(file);
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        drop(file);
+        let digest = Digest::parse(&format!(
+            "sha256:{}",
+            hex_encode(&sha2::Digest::finalize(hasher))
+        ))?;
+        if let Some(exp) = expected {
+            if *exp != digest {
+                let _ = fs::remove_file(&tmp);
+                return Err(Error::invalid_argument(format!(
+                    "digest mismatch: expected {}, got {}",
+                    exp.full(),
+                    digest.full()
+                )));
+            }
+        }
+        if let Some(size) = expected_size {
+            if size != total {
+                let _ = fs::remove_file(&tmp);
+                return Err(Error::invalid_argument(format!(
+                    "size mismatch: expected {size} bytes, got {total}"
+                )));
+            }
+        }
+        let target = self.blob_path(&digest);
+        if target.exists() {
+            let existing_digest = match digest_file(&target) {
+                Ok(existing) => existing,
+                Err(e) => {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(e);
+                }
+            };
+            if existing_digest != digest {
+                let _ = fs::remove_file(&tmp);
+                return Err(Error::internal(format!(
+                    "content-addressed blob {} already exists with different content (hashes to {}); store corrupted",
+                    digest.full(),
+                    existing_digest.full()
+                )));
+            }
+            fs::remove_file(&tmp)?;
+            return Ok((digest, total));
+        }
+        if let Err(e) = fs::rename(&tmp, &target) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        Ok((digest, total))
+    }
+
     /// Read a blob. Missing blobs are `NotFound`.
     pub fn get(&self, digest: &Digest) -> Result<Vec<u8>> {
         let target = self.blob_path(digest);
@@ -190,6 +284,35 @@ impl BlobStore {
         out.sort_by_key(|a| a.digest.full());
         Ok(out)
     }
+}
+
+/// Hash an existing file without loading it into memory (streaming dedupe).
+fn digest_file(path: &Path) -> Result<Digest> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        sha2::Digest::update(&mut hasher, &buf[..n]);
+    }
+    Digest::parse(&format!(
+        "sha256:{}",
+        hex_encode(&sha2::Digest::finalize(hasher))
+    ))
+}
+
+/// Lowercase hex encoding (digests and temp names).
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// Parse an `oci-layout` marker and return its `imageLayoutVersion`.
@@ -317,6 +440,70 @@ mod tests {
         let (d, s) = store.put_verified(&expected, b"actual-content").unwrap();
         assert_eq!(d, expected);
         assert_eq!(s, 14);
+    }
+
+    #[test]
+    fn put_stream_round_trip() {
+        let (_dir, store) = tmp_store();
+        let mut cursor = std::io::Cursor::new(b"streamed-content");
+        let expected = Digest::sha256(b"streamed-content");
+        let (d, n) = store
+            .put_stream(Some(&expected), Some(16), &mut cursor)
+            .unwrap();
+        assert_eq!(d, expected);
+        assert_eq!(n, 16);
+        assert_eq!(store.get_verified(&d).unwrap(), b"streamed-content");
+    }
+
+    #[test]
+    fn put_stream_mismatch_leaves_no_content() {
+        let (_dir, store) = tmp_store();
+        let wrong = Digest::sha256(b"other");
+        let mut cursor = std::io::Cursor::new(b"streamed-different");
+        let err = store
+            .put_stream(Some(&wrong), None, &mut cursor)
+            .unwrap_err();
+        assert_eq!(err.kind(), docker_errors::ErrorKind::InvalidArgument);
+        assert!(err.message().contains("digest mismatch"));
+        assert_eq!(store.list().unwrap().len(), 0);
+        // No temp files either.
+        let entries = std::fs::read_dir(store.root().join("sha256"))
+            .unwrap()
+            .count();
+        assert_eq!(entries, 0);
+
+        let mut cursor = std::io::Cursor::new(b"size-check");
+        let err = store.put_stream(None, Some(99), &mut cursor).unwrap_err();
+        assert_eq!(err.kind(), docker_errors::ErrorKind::InvalidArgument);
+        assert!(err.message().contains("size mismatch"));
+        assert_eq!(store.list().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn put_stream_dedupes_existing_blob() {
+        let (_dir, store) = tmp_store();
+        store.put(b"dup").unwrap();
+        let mut cursor = std::io::Cursor::new(b"dup");
+        let (d, n) = store.put_stream(None, None, &mut cursor).unwrap();
+        assert_eq!(d, Digest::sha256(b"dup"));
+        assert_eq!(n, 3);
+        assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn put_stream_detects_corrupted_existing_blob() {
+        let (_dir, store) = tmp_store();
+        let digest = Digest::sha256(b"expected");
+        fs::write(store.blob_path(&digest), b"tampered").unwrap();
+        let mut cursor = std::io::Cursor::new(b"expected");
+        let err = store
+            .put_stream(Some(&digest), Some(8), &mut cursor)
+            .unwrap_err();
+        assert_eq!(err.kind(), docker_errors::ErrorKind::Internal);
+        assert!(err.message().contains("store corrupted"));
+        // The rejected stream left no temp file behind.
+        let entries = fs::read_dir(store.root().join("sha256")).unwrap().count();
+        assert_eq!(entries, 1);
     }
 
     #[test]
