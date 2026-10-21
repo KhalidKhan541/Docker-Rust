@@ -95,6 +95,7 @@ fn foundation_vertical_slice() {
             exit_code: None,
             error_signal: None,
         },
+        host_config: HostConfig::default(),
     };
     store.put(record).unwrap();
     assert_eq!(
@@ -201,6 +202,7 @@ fn foundation_error_paths() {
             exit_code: None,
             error_signal: None,
         },
+        host_config: HostConfig::default(),
     };
     store.put(mk(&a, "one")).unwrap();
     store.put(mk(&b, "two")).unwrap();

@@ -92,6 +92,23 @@ impl Signal {
             Signal::Sigpipe => "SIGPIPE",
         }
     }
+
+    /// POSIX signal number as used by the Engine API (`kill` event attribute,
+    /// `docker kill --signal`). Linux numbering; the daemon reports the same
+    /// integers on every platform.
+    pub fn number(self) -> i32 {
+        match self {
+            Signal::Sighup => 1,
+            Signal::Sigint => 2,
+            Signal::Sigquit => 3,
+            Signal::Sigkill => 9,
+            Signal::Sigusr1 => 10,
+            Signal::Sigusr2 => 12,
+            Signal::Sigpipe => 13,
+            Signal::Sigalrm => 14,
+            Signal::Sigterm => 15,
+        }
+    }
 }
 
 impl FromStr for Signal {
@@ -213,8 +230,8 @@ pub enum RestartPolicy {
     No,
     /// Restart on non-zero exit, capped by `maximum_retry_count` if set.
     OnFailure,
-    /// Always restart regardless of exit status. The daemon автомобилей
-    /// restarts and caps nothing.
+    /// Always restart regardless of exit status. The daemon schedules
+    /// restarts with backoff and never caps the count.
     Always,
     /// Always except on a stopped-by-user (clean stop) reload.
     UnlessStopped,

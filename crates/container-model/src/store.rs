@@ -11,15 +11,18 @@ use std::collections::HashMap;
 use docker_common::ContainerId;
 use docker_errors::{Error, Result};
 
-use crate::config::ContainerConfig;
+use crate::config::{ContainerConfig, HostConfig};
 use crate::state::StateSnapshot;
 
-/// One tracked container: identity + config + observed state.
+/// One tracked container: identity + configs + observed state.
 #[derive(Debug, Clone)]
 pub struct ContainerRecord {
     pub id: ContainerId,
     pub name: Option<String>,
     pub config: ContainerConfig,
+    /// Host-side options are part of the record because restart policy and
+    /// auto-remove are consulted on every exit, not only at start.
+    pub host_config: HostConfig,
     pub state: StateSnapshot,
 }
 
@@ -75,6 +78,15 @@ impl ContainerStore {
     pub fn get(&self, id: &ContainerId) -> Result<&ContainerRecord> {
         self.by_id
             .get(id)
+            .ok_or_else(|| Error::not_found(format!("no such container: {id}")))
+    }
+
+    /// Mutable access for the daemon actor (its single owner). Exposing this
+    /// rather than remove+reinsert keeps the ID index stable during lifecycle
+    /// transitions.
+    pub fn get_mut(&mut self, id: &ContainerId) -> Result<&mut ContainerRecord> {
+        self.by_id
+            .get_mut(id)
             .ok_or_else(|| Error::not_found(format!("no such container: {id}")))
     }
 
@@ -164,6 +176,7 @@ mod tests {
                 exit_code: None,
                 error_signal: None,
             },
+            host_config: crate::config::HostConfig::default(),
         }
     }
 
