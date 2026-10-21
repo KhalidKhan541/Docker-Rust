@@ -546,6 +546,8 @@ fn start_failure_leaves_container_created_and_can_retry() {
             status: LifecycleState::Created,
             exit_code: None,
             error_signal: None,
+            started_at: None,
+            finished_at: None,
         }
     );
     assert_eq!(runtime.created().len(), 1);

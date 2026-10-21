@@ -89,11 +89,14 @@ fn foundation_vertical_slice() {
     let record = ContainerRecord {
         id: id.clone(),
         name: Some(name.as_str().into()),
+        created_at: 1_700_000_000,
         config: config.clone(),
         state: StateSnapshot {
             status: LifecycleState::Running,
             exit_code: None,
             error_signal: None,
+            started_at: Some(1_700_000_001),
+            finished_at: None,
         },
         host_config: HostConfig::default(),
     };
@@ -182,6 +185,7 @@ fn foundation_error_paths() {
     let mk = |id: &ContainerId, name: &str| ContainerRecord {
         id: id.clone(),
         name: Some(name.into()),
+        created_at: 1_700_000_000,
         config: ContainerConfig {
             image: ImageRef::parse("alpine").unwrap(),
             entrypoint: vec![],
@@ -201,6 +205,8 @@ fn foundation_error_paths() {
             status: LifecycleState::Created,
             exit_code: None,
             error_signal: None,
+            started_at: None,
+            finished_at: None,
         },
         host_config: HostConfig::default(),
     };
