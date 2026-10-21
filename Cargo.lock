@@ -21,6 +21,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ascii"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d92bec98840b8f03a5ff5413de5293bfcd8bf96467cf5452609f939ec6f5de16"
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -90,6 +96,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "chunked_transfer"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e4de3bc4ea267985becf712dc6d9eed8b04c953b3fcfb339ebc87acd9804901"
+
+[[package]]
 name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -138,6 +150,23 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+]
+
+[[package]]
+name = "docker-api"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "docker-common",
+ "docker-container-model",
+ "docker-daemon",
+ "docker-errors",
+ "docker-events",
+ "getrandom 0.2.17",
+ "serde",
+ "serde_json",
+ "tiny_http",
+ "tracing",
 ]
 
 [[package]]
@@ -262,6 +291,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "docker-rsd"
+version = "0.1.0"
+dependencies = [
+ "docker-api",
+ "docker-configuration",
+ "docker-daemon",
+ "docker-errors",
+ "docker-events",
+ "docker-logging",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "docker-runtime"
 version = "0.1.0"
 dependencies = [
@@ -379,6 +422,12 @@ dependencies = [
  "libc",
  "r-efi",
 ]
+
+[[package]]
+name = "httpdate"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "iana-time-zone"
@@ -879,6 +928,18 @@ checksum = "7e689342a48d2ea927c87ea50cabf8594854bf940e9310208848d680d668ed85"
 dependencies = [
  "num-conv",
  "time-core",
+]
+
+[[package]]
+name = "tiny_http"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "389915df6413a2e74fb181895f933386023c71110878cd0825588928e64cdc82"
+dependencies = [
+ "ascii",
+ "chunked_transfer",
+ "httpdate",
+ "log",
 ]
 
 [[package]]
