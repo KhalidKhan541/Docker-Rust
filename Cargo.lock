@@ -162,9 +162,12 @@ dependencies = [
  "docker-daemon",
  "docker-errors",
  "docker-events",
+ "docker-image",
+ "docker-image-store",
  "getrandom 0.2.17",
  "serde",
  "serde_json",
+ "tempfile",
  "tiny_http",
  "tracing",
 ]
@@ -260,6 +263,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "docker-image-store"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "docker-common",
+ "docker-distribution",
+ "docker-errors",
+ "docker-image",
+ "docker-storage",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "docker-logging"
 version = "0.1.0"
 dependencies = [
@@ -299,6 +318,7 @@ dependencies = [
  "docker-daemon",
  "docker-errors",
  "docker-events",
+ "docker-image-store",
  "docker-logging",
  "serde_json",
  "tracing",

@@ -1,0 +1,23 @@
+[package]
+name = "docker-image-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Persistent local image metadata and registry pulls for docker-rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+docker-common = { workspace = true }
+docker-errors = { workspace = true }
+docker-image = { workspace = true }
+docker-storage = { workspace = true }
+docker-distribution = { workspace = true }
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
