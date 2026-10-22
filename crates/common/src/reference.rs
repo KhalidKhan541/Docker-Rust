@@ -93,6 +93,11 @@ impl ImageRef {
         self.repo()
     }
 
+    /// Explicit tag, if the reference carried one.
+    pub fn tag(&self) -> Option<&str> {
+        self.tag.as_deref()
+    }
+
     /// Effective tag, or `latest` when absent — the Engine API resolves a
     /// bare reference to `latest`.
     pub fn effective_tag(&self) -> &str {
