@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod dto;
+pub mod image_dto;
 pub mod query;
 pub mod server;
 pub mod version;

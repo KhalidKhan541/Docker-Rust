@@ -16,6 +16,7 @@ use docker_container_model::state::{LifecycleState, StateSnapshot};
 use docker_container_model::store::ContainerFilter;
 use docker_daemon::{ContainerView, CreateRequest};
 use docker_errors::{Error, Result};
+use docker_image::Image;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -740,6 +741,17 @@ pub struct LogConfigDto {
 impl CreateRequestDto {
     /// Validate and convert a decoded create request.
     pub fn into_daemon(self, name: Option<String>) -> Result<CreateRequest> {
+        self.into_daemon_with_image(name, None)
+    }
+
+    /// Validate and convert a decoded create request, applying the execution
+    /// defaults that Moby inherits from the resolved image config. Container
+    /// fields supplied by the client win; image values fill only unset fields.
+    pub fn into_daemon_with_image(
+        self,
+        name: Option<String>,
+        image: Option<&Image>,
+    ) -> Result<CreateRequest> {
         if self.image.trim().is_empty() {
             return Err(Error::invalid_argument("invalid image: empty image name"));
         }
@@ -775,8 +787,18 @@ impl CreateRequestDto {
         }
         reject_extra("container config", &self.extra)?;
 
-        let image = ImageRef::parse(&self.image)?;
-        let stop_signal = match self.stop_signal.as_deref().filter(|s| !s.is_empty()) {
+        let image_ref = ImageRef::parse(&self.image)?;
+        let image_config = image.map(|image| &image.config);
+        let inherited_stop_signal = image_config
+            .map(|config| config.stop_signal.trim())
+            .filter(|signal| !signal.is_empty());
+        let stop_signal = match self
+            .stop_signal
+            .as_deref()
+            .map(str::trim)
+            .filter(|signal| !signal.is_empty())
+            .or(inherited_stop_signal)
+        {
             None => Signal::Sigterm,
             Some(signal) => signal.parse()?,
         };
@@ -789,16 +811,48 @@ impl CreateRequestDto {
                 )))
             }
         };
-        let exposed_ports = parse_exposed_ports(self.exposed_ports)?;
-        let labels = self.labels.unwrap_or_default();
+        let mut exposed_ports = parse_exposed_ports(self.exposed_ports)?;
+        if let Some(config) = image_config {
+            for key in config.exposed_ports.keys() {
+                let port: PortKey = key.parse()?;
+                if !exposed_ports.contains(&port) {
+                    exposed_ports.push(port);
+                }
+            }
+        }
+        exposed_ports.sort_by_key(|port| (port.port, port.proto.to_string()));
+        exposed_ports.dedup();
+        let labels = merge_labels(
+            image_config.map(|config| &config.labels),
+            self.labels.unwrap_or_default(),
+        );
+        let working_dir = non_empty(self.working_dir).or_else(|| {
+            image_config
+                .map(|config| config.working_dir.trim())
+                .filter(|dir| !dir.is_empty())
+                .map(str::to_string)
+        });
+        let user = non_empty(self.user).or_else(|| {
+            image_config
+                .map(|config| config.user.trim())
+                .filter(|user| !user.is_empty())
+                .map(str::to_string)
+        });
         let config = ContainerConfig {
-            image,
-            entrypoint: self.entrypoint.unwrap_or_default(),
-            cmd: self.cmd.unwrap_or_default(),
-            env: self.env.unwrap_or_default(),
+            image: image_ref,
+            entrypoint: non_empty_list(self.entrypoint)
+                .or_else(|| image_config.map(|config| config.entrypoint.clone()))
+                .unwrap_or_default(),
+            cmd: non_empty_list(self.cmd)
+                .or_else(|| image_config.map(|config| config.cmd.clone()))
+                .unwrap_or_default(),
+            env: merge_env(
+                image_config.map(|config| config.env.as_slice()),
+                self.env.unwrap_or_default(),
+            ),
             labels,
-            working_dir: non_empty(self.working_dir),
-            user: non_empty(self.user),
+            working_dir,
+            user,
             hostname: non_empty(self.hostname),
             tty: self.tty,
             open_stdin: self.open_stdin,
@@ -938,6 +992,38 @@ fn non_empty(value: String) -> Option<String> {
     } else {
         Some(value)
     }
+}
+
+fn non_empty_list(value: Option<Vec<String>>) -> Option<Vec<String>> {
+    value.filter(|items| !items.is_empty())
+}
+
+/// `docker run -e` semantics: inherited image entries keep their position,
+/// while a container entry with the same key replaces the inherited value.
+fn merge_env(inherited: Option<&[String]>, overrides: Vec<String>) -> Vec<String> {
+    let mut merged = inherited.map(<[String]>::to_vec).unwrap_or_default();
+    for entry in overrides {
+        let key = entry.split_once('=').map_or(entry.as_str(), |(key, _)| key);
+        match merged.iter().position(|existing| {
+            existing
+                .split_once('=')
+                .map_or(existing.as_str(), |(k, _)| k)
+                == key
+        }) {
+            Some(index) => merged[index] = entry,
+            None => merged.push(entry),
+        }
+    }
+    merged
+}
+
+fn merge_labels(
+    inherited: Option<&BTreeMap<String, String>>,
+    overrides: BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut merged = inherited.cloned().unwrap_or_default();
+    merged.extend(overrides);
+    merged
 }
 
 fn ensure_mode(field: &str, value: &str, allowed: &[&str]) -> Result<()> {

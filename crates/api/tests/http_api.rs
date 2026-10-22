@@ -9,13 +9,20 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use docker_api::{ApiServer, RunningServer};
+use docker_common::{Digest, ImageRef};
 use docker_daemon::{Daemon, SyntheticBehavior, SyntheticRuntime};
 use docker_events::EventBroker;
+use docker_image::{
+    Descriptor, EmptyObject, Image, ImageConfig, Platform, RootFS, MEDIA_TYPE_IMAGE_CONFIG,
+    MEDIA_TYPE_IMAGE_LAYER_GZIP, MEDIA_TYPE_IMAGE_MANIFEST,
+};
+use docker_image_store::{canonical_repo_digest, canonical_tag, ImageRecord, ImageStore};
 use serde_json::{json, Value};
 
 struct Response {
@@ -688,4 +695,412 @@ fn events_replay_filtering_and_live_streaming() {
     assert_eq!(live.status, 200);
     assert!(live.text().contains(r#""action":"create""#));
     assert!(live.text().contains(r#""name":"late""#));
+}
+
+fn digest(byte: u8) -> Digest {
+    Digest::parse(&format!("sha256:{}", format!("{byte:02x}").repeat(32))).unwrap()
+}
+
+fn sample_image() -> ImageRecord {
+    let reference = ImageRef::parse("alpine:3.20").unwrap();
+    let mut config = ImageConfig {
+        cmd: vec!["/bin/sh".into()],
+        entrypoint: vec!["/entry".into()],
+        env: vec!["PATH=/usr/bin".into()],
+        working_dir: "/work".into(),
+        user: "1000".into(),
+        stop_signal: "SIGINT".into(),
+        ..ImageConfig::default()
+    };
+    config.labels.insert("org.example".into(), "test".into());
+    config.exposed_ports.insert("8080/tcp".into(), EmptyObject);
+    ImageRecord {
+        id: digest(0xaa),
+        manifest_digest: digest(0xbb),
+        manifest_digests: vec![digest(0xbb)],
+        tags: [canonical_tag(&reference).unwrap()].into_iter().collect(),
+        repo_digests: [canonical_repo_digest(&reference, &digest(0xbb))]
+            .into_iter()
+            .collect(),
+        created: 1_700_000_000,
+        pulled_at: 1_700_000_001,
+        size: 200,
+        config_size: 77,
+        platform: Platform {
+            os: "linux".into(),
+            architecture: "amd64".into(),
+            ..Platform::default()
+        },
+        config: Image {
+            architecture: "amd64".into(),
+            os: "linux".into(),
+            config,
+            rootfs: RootFS::layers(vec![digest(0xcc)]),
+            ..Image::default()
+        },
+        layers: vec![Descriptor {
+            media_type: MEDIA_TYPE_IMAGE_LAYER_GZIP.into(),
+            digest: digest(0xdd),
+            size: 123,
+            ..Descriptor::default()
+        }],
+    }
+}
+
+fn spawn_api_with_images() -> (RunningServer, tempfile::TempDir) {
+    let runtime = Arc::new(SyntheticRuntime::with_behavior(
+        SyntheticBehavior::running_until_killed(),
+    ));
+    let broker = Arc::new(EventBroker::new());
+    let daemon = Arc::new(Daemon::spawn(runtime, broker.clone()).unwrap());
+    let directory = tempfile::tempdir().unwrap();
+    let store = ImageStore::open(directory.path().join("images")).unwrap();
+    store.insert(sample_image()).unwrap();
+    let api = Arc::new(ApiServer::new(daemon, broker).with_image_store(Arc::new(store)));
+    let server = api.serve("127.0.0.1:0").unwrap();
+    (server, directory)
+}
+
+#[test]
+fn image_list_inspect_tag_history_and_delete() {
+    let (server, _directory) = spawn_api_with_images();
+    let addr = server.addr();
+
+    let list = http(addr, "GET", "/images/json", None, None);
+    assert_eq!(list.status, 200, "{}", list.text());
+    let list = list.json();
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    let id = digest(0xaa).full();
+    assert_eq!(list[0]["Id"], id);
+    assert_eq!(list[0]["RepoTags"], json!(["alpine:3.20"]));
+    assert_eq!(
+        list[0]["RepoDigests"],
+        json!([format!("alpine@{}", digest(0xbb).full())])
+    );
+    assert_eq!(list[0]["Size"], 200);
+    assert_eq!(list[0]["Containers"], -1);
+    assert_eq!(list[0]["Labels"]["org.example"], "test");
+
+    for path in [
+        "/images/alpine:3.20/json".to_string(),
+        "/images/alpine%3A3.20/json".to_string(),
+        format!("/images/{}/json", &id[..16]),
+    ] {
+        let inspect = http(addr, "GET", &path, None, None);
+        assert_eq!(inspect.status, 200, "{path}: {}", inspect.text());
+        let inspect = inspect.json();
+        assert_eq!(inspect["Id"], id);
+        assert_eq!(inspect["Architecture"], "amd64");
+        assert_eq!(inspect["Os"], "linux");
+        assert_eq!(inspect["Config"]["Cmd"], json!(["/bin/sh"]));
+        assert_eq!(inspect["RootFS"]["Layers"], json!([digest(0xcc).full()]));
+        assert_eq!(inspect["GraphDriver"]["Name"], "docker-rs");
+    }
+
+    let tagged = http(
+        addr,
+        "POST",
+        "/images/alpine:3.20/tag?repo=team/app&tag=dev",
+        None,
+        None,
+    );
+    assert_eq!(tagged.status, 201, "{}", tagged.text());
+    let by_slash_name = http(addr, "GET", "/images/team/app:dev/json", None, None);
+    assert_eq!(by_slash_name.status, 200, "{}", by_slash_name.text());
+    assert_eq!(by_slash_name.json()["Id"], id);
+
+    let history = http(addr, "GET", "/images/alpine:3.20/history", None, None);
+    assert_eq!(history.status, 200, "{}", history.text());
+    assert!(history.json().is_array());
+
+    let untag = http(addr, "DELETE", "/images/alpine:3.20", None, None);
+    assert_eq!(untag.status, 200, "{}", untag.text());
+    assert_eq!(untag.json(), json!([{"Untagged": "alpine:3.20"}]));
+    let still_there = http(addr, "GET", "/images/team/app:dev/json", None, None);
+    assert_eq!(still_there.status, 200);
+
+    let delete = http(addr, "DELETE", "/images/team/app:dev?force=1", None, None);
+    assert_eq!(delete.status, 200, "{}", delete.text());
+    let delete = delete.json();
+    assert_eq!(delete[0], json!({"Untagged": "team/app:dev"}));
+    assert_eq!(delete[1], json!({"Deleted": id}));
+    assert_eq!(
+        http(addr, "GET", "/images/json", None, None).json(),
+        json!([])
+    );
+
+    let missing = http(addr, "GET", "/images/alpine:3.20/json", None, None);
+    assert_eq!(missing.status, 404);
+    assert!(missing.text().contains("No such image"));
+}
+
+#[test]
+fn container_create_requires_a_local_image_and_inherits_image_defaults() {
+    let (server, _directory) = spawn_api_with_images();
+    let addr = server.addr();
+
+    let missing = serde_json::to_vec(&json!({"Image": "missing:latest"})).unwrap();
+    let response = http(
+        addr,
+        "POST",
+        "/containers/create",
+        Some(&missing),
+        Some("application/json"),
+    );
+    assert_eq!(response.status, 404, "{}", response.text());
+    assert!(response.text().contains("No such image"));
+
+    let body = serde_json::to_vec(&json!({
+        "Image": "alpine:3.20",
+        "Env": ["EXTRA=1", "PATH=/override"],
+        "Labels": {"role": "web"},
+        "ExposedPorts": {"9090/tcp": {}},
+        "Cmd": []
+    }))
+    .unwrap();
+    let created = http(
+        addr,
+        "POST",
+        "/containers/create?name=from-image",
+        Some(&body),
+        Some("application/json"),
+    );
+    assert_eq!(created.status, 201, "{}", created.text());
+    let id = created.json()["Id"].as_str().unwrap().to_string();
+
+    let inspect = http(addr, "GET", &format!("/containers/{id}/json"), None, None);
+    assert_eq!(inspect.status, 200, "{}", inspect.text());
+    let config = &inspect.json()["Config"];
+    assert_eq!(config["Cmd"], json!(["/bin/sh"]));
+    assert_eq!(config["Entrypoint"], json!(["/entry"]));
+    assert_eq!(config["Env"], json!(["PATH=/override", "EXTRA=1"]));
+    assert_eq!(config["Labels"]["org.example"], "test");
+    assert_eq!(config["Labels"]["role"], "web");
+    assert_eq!(config["WorkingDir"], "/work");
+    assert_eq!(config["User"], "1000");
+    assert_eq!(config["StopSignal"], "SIGINT");
+    assert_eq!(config["ExposedPorts"]["8080/tcp"], json!({}));
+    assert_eq!(config["ExposedPorts"]["9090/tcp"], json!({}));
+}
+
+#[test]
+fn image_endpoints_are_honest_without_a_store_and_for_unimplemented_features() {
+    let (server, _) = spawn_api();
+    let addr = server.addr();
+
+    let list = http(addr, "GET", "/images/json", None, None);
+    assert_eq!(list.status, 501);
+    assert!(list.text().contains("image store is not configured"));
+
+    let (server, _directory) = spawn_api_with_images();
+    let addr = server.addr();
+    let source = http(
+        addr,
+        "POST",
+        "/images/create?fromImage=alpine&fromSrc=somewhere",
+        None,
+        None,
+    );
+    assert_eq!(source.status, 501, "{}", source.text());
+    assert!(source.text().contains("from a source"), "{}", source.text());
+    let prune = http(addr, "POST", "/images/prune", None, None);
+    assert_eq!(prune.status, 501);
+    let save = http(addr, "GET", "/images/alpine:3.20/get", None, None);
+    assert_eq!(save.status, 501);
+    let filters = encoded(r#"{"reference":["alpine"]}"#);
+    let unsupported = http(
+        addr,
+        "GET",
+        &format!("/images/json?filters={filters}"),
+        None,
+        None,
+    );
+    assert_eq!(unsupported.status, 501);
+    assert!(unsupported.text().contains("filters"));
+}
+
+/// Minimal OCI registry serving one manifest/config/layer pair over loopback.
+/// This exercises the real registry client, blob verification and pull status
+/// stream without reaching the public internet.
+struct RegistryFixture {
+    host: String,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for RegistryFixture {
+    fn drop(&mut self) {
+        self.stop.store(true, AtomicOrdering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn registry_fixture() -> RegistryFixture {
+    let layer = b"not-a-real-tarball".to_vec();
+    let layer_digest = Digest::sha256(&layer);
+    let diff_id = Digest::sha256(b"uncompressed-layer");
+    let config = serde_json::to_vec(&json!({
+        "created": "2024-01-02T03:04:05Z",
+        "architecture": "amd64",
+        "os": "linux",
+        "config": {
+            "Cmd": ["/fixture"],
+            "Env": ["PATH=/fixture/bin"],
+            "Labels": {"fixture": "yes"}
+        },
+        "rootfs": {
+            "type": "layers",
+            "diff_ids": [diff_id.full()]
+        },
+        "history": []
+    }))
+    .unwrap();
+    let config_digest = Digest::sha256(&config);
+    let manifest = serde_json::to_vec(&json!({
+        "schemaVersion": 2,
+        "mediaType": MEDIA_TYPE_IMAGE_MANIFEST,
+        "config": {
+            "mediaType": MEDIA_TYPE_IMAGE_CONFIG,
+            "digest": config_digest.full(),
+            "size": config.len()
+        },
+        "layers": [{
+            "mediaType": MEDIA_TYPE_IMAGE_LAYER_GZIP,
+            "digest": layer_digest.full(),
+            "size": layer.len()
+        }]
+    }))
+    .unwrap();
+    let manifest_digest = Digest::sha256(&manifest);
+
+    let server = tiny_http::Server::http("127.0.0.1:0").expect("bind registry fixture");
+    let address = server.server_addr().to_ip().expect("TCP registry");
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let handle = thread::spawn(move || {
+        while !thread_stop.load(AtomicOrdering::Relaxed) {
+            let request = match server.recv_timeout(Duration::from_millis(50)) {
+                Ok(Some(request)) => request,
+                Ok(None) => continue,
+                Err(_) => break,
+            };
+            let path = request
+                .url()
+                .split('?')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let response = if path == "/v2/" {
+                tiny_http::Response::from_data(Vec::new())
+            } else if path == "/v2/team/app/manifests/latest"
+                || path == "/v2/team/app/manifests/dev"
+                || path == format!("/v2/team/app/manifests/{}", manifest_digest.full())
+            {
+                tiny_http::Response::from_data(manifest.clone())
+                    .with_header(
+                        tiny_http::Header::from_bytes("Content-Type", MEDIA_TYPE_IMAGE_MANIFEST)
+                            .expect("static content type"),
+                    )
+                    .with_header(
+                        tiny_http::Header::from_bytes(
+                            "Docker-Content-Digest",
+                            manifest_digest.full(),
+                        )
+                        .expect("digest header"),
+                    )
+            } else if path == format!("/v2/team/app/blobs/{}", config_digest.full()) {
+                tiny_http::Response::from_data(config.clone()).with_header(
+                    tiny_http::Header::from_bytes("Content-Type", MEDIA_TYPE_IMAGE_CONFIG)
+                        .expect("static content type"),
+                )
+            } else if path == format!("/v2/team/app/blobs/{}", layer_digest.full()) {
+                tiny_http::Response::from_data(layer.clone()).with_header(
+                    tiny_http::Header::from_bytes("Content-Type", MEDIA_TYPE_IMAGE_LAYER_GZIP)
+                        .expect("static content type"),
+                )
+            } else {
+                tiny_http::Response::from_data(Vec::new()).with_status_code(404)
+            };
+            let _ = request.respond(response);
+        }
+    });
+    RegistryFixture {
+        host: address.to_string(),
+        stop,
+        handle: Some(handle),
+    }
+}
+
+#[test]
+fn image_pull_uses_the_registry_client_and_persists_metadata() {
+    let fixture = registry_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let store = ImageStore::open(directory.path().join("images")).unwrap();
+    let runtime = Arc::new(SyntheticRuntime::with_behavior(
+        SyntheticBehavior::running_until_killed(),
+    ));
+    let broker = Arc::new(EventBroker::new());
+    let daemon = Arc::new(Daemon::spawn(runtime, broker.clone()).unwrap());
+    let api = Arc::new(ApiServer::new(daemon, broker).with_image_store(Arc::new(store)));
+    let server = api.serve("127.0.0.1:0").unwrap();
+    let addr = server.addr();
+
+    let from_image = encoded(&format!("{}/team/app", fixture.host));
+    let platform = encoded("linux/amd64");
+    let path = format!("/images/create?fromImage={from_image}&tag=dev&platform={platform}");
+    let pulled = http(addr, "POST", &path, None, None);
+    assert_eq!(pulled.status, 200, "{}", pulled.text());
+    let messages: Vec<Value> = pulled
+        .text()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(messages.iter().any(|message| message["status"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("Pulling from ")));
+    assert!(messages.iter().any(|message| message["status"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Downloaded newer image for")));
+
+    let list = http(addr, "GET", "/images/json", None, None).json();
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(
+        list[0]["RepoTags"],
+        json!([format!("{}/team/app:dev", fixture.host)])
+    );
+    let inspect = http(
+        addr,
+        "GET",
+        &format!("/images/{}/team/app:dev/json", fixture.host),
+        None,
+        None,
+    );
+    assert_eq!(inspect.status, 200, "{}", inspect.text());
+    let inspect = inspect.json();
+    assert_eq!(inspect["Config"]["Cmd"], json!(["/fixture"]));
+    assert_eq!(
+        inspect["RootFS"]["Layers"],
+        json!([Digest::sha256(b"uncompressed-layer").full()])
+    );
+
+    let again = http(addr, "POST", &path, None, None);
+    assert_eq!(again.status, 200, "{}", again.text());
+    assert!(again.text().contains("Image is up to date for"));
+
+    drop(server);
+    let reopened = ImageStore::open(directory.path().join("images")).unwrap();
+    assert_eq!(reopened.list(false).len(), 1);
+    assert_eq!(
+        reopened
+            .resolve(&format!("{}/team/app:dev", fixture.host))
+            .unwrap()
+            .config
+            .config
+            .cmd,
+        vec!["/fixture".to_string()]
+    );
 }

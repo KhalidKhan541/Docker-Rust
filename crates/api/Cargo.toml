@@ -8,12 +8,17 @@ description = "Docker Engine HTTP API over the docker-rs daemon actor"
 [lints.rust]
 unsafe_code = "forbid"
 
+[dev-dependencies]
+tempfile = "3"
+
 [dependencies]
 docker-common = { workspace = true }
 docker-errors = { workspace = true }
 docker-container-model = { workspace = true }
 docker-events = { workspace = true }
+docker-image = { workspace = true }
 docker-daemon = { workspace = true }
+docker-image-store = { workspace = true }
 chrono = { workspace = true }
 getrandom = { workspace = true }
 serde = { workspace = true }

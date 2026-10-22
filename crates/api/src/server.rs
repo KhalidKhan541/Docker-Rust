@@ -15,10 +15,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{SecondsFormat, Utc};
+use docker_common::ImageRef;
 use docker_container_model::config::Signal;
 use docker_container_model::state::LifecycleState;
 use docker_errors::{Error, Result};
 use docker_events::{Event, EventBroker, Subscription};
+use docker_image_store::{canonical_registry_repo, parse_registry_auth, ImageStore, RegistryAuth};
 use serde::Serialize;
 use serde_json::Value;
 use tiny_http::{Header, Request, Response, StatusCode};
@@ -27,6 +29,9 @@ use crate::dto::{
     self, ContainerSummary, CreateResponse, ErrorResponse, InfoPlugins, InfoResponse,
     InspectResponse, RuntimeInfo, SwarmInfo, VersionComponent, VersionPlatform, VersionResponse,
     WaitResponse, MAX_BODY_BYTES,
+};
+use crate::image_dto::{
+    history_items, ImageDeleteItem, ImageInspectResponse, ImagePullMessage, ImageSummary,
 };
 use crate::query::{ContainerListOptions, EventFilters, EventOptions, Query};
 use crate::version::{self, VersionDecision, VersionGate, VersionUnsupported};
@@ -60,6 +65,7 @@ impl Default for ServerConfig {
 pub struct ApiServer {
     daemon: Arc<docker_daemon::Daemon>,
     broker: Arc<EventBroker>,
+    images: Option<Arc<ImageStore>>,
     gate: VersionGate,
     config: ServerConfig,
     daemon_id: String,
@@ -83,10 +89,19 @@ impl ApiServer {
         Ok(Self {
             daemon,
             broker,
+            images: None,
             gate,
             config,
             daemon_id: random_hex(16),
         })
+    }
+
+    /// Attach a persistent local image store. Without one, image endpoints
+    /// return an explicit `Unsupported` error instead of pretending no images
+    /// exist.
+    pub fn with_image_store(mut self, images: Arc<ImageStore>) -> Self {
+        self.images = Some(images);
+        self
     }
 
     /// Bind and serve on `addr`. The returned handle stops the accept loop on
@@ -247,6 +262,18 @@ impl ApiServer {
             }
             ["containers", id] if method == "DELETE" => self.remove(id, &query),
             ["containers", id, action] => self.unsupported_container_action(id, action),
+            ["images", "json"] if method == "GET" => self.image_list(&query),
+            ["images", "create"] if method == "POST" => self.image_pull(request, &query),
+            ["images", "prune"] if method == "POST" => Err(ApiError::from(Error::unsupported(
+                "image prune is not implemented",
+            ))),
+            ["images", "search"] if method == "GET" => Err(ApiError::from(Error::unsupported(
+                "image search is not implemented",
+            ))),
+            ["images", "load"] if method == "POST" => Err(ApiError::from(Error::unsupported(
+                "image load is not implemented",
+            ))),
+            ["images", rest @ ..] => self.route_image(method, rest, &query),
             _ => Err(ApiError::not_found("page not found")),
         }
     }
@@ -336,17 +363,27 @@ impl ApiServer {
         } else {
             Vec::new()
         };
+        let image_count = self
+            .images
+            .as_ref()
+            .map(|images| images.list(true).len())
+            .unwrap_or(0);
+        let image_status = if self.images.is_some() {
+            "connected"
+        } else {
+            "not connected"
+        };
         let body = InfoResponse {
             id: self.daemon_id.clone(),
             containers: total,
             containers_running: running,
             containers_paused: paused,
             containers_stopped: stopped,
-            images: 0,
+            images: image_count,
             driver: "docker-rs".to_string(),
             driver_status: vec![
                 ["Runtime".to_string(), self.config.runtime_name.clone()],
-                ["Images".to_string(), "not connected".to_string()],
+                ["Images".to_string(), image_status.to_string()],
             ],
             plugins: InfoPlugins {
                 volume: Vec::new(),
@@ -441,6 +478,204 @@ impl ApiServer {
         Ok(Reply::json(200, &body))
     }
 
+    fn image_store(&self) -> std::result::Result<&ImageStore, ApiError> {
+        self.images.as_deref().ok_or_else(|| {
+            ApiError::from(Error::unsupported(
+                "image store is not configured (start docker-rsd with a data root)",
+            ))
+        })
+    }
+
+    fn route_image(
+        &self,
+        method: &str,
+        rest: &[&str],
+        query: &Query,
+    ) -> std::result::Result<Reply, ApiError> {
+        if rest.is_empty() {
+            return Err(ApiError::not_found("page not found"));
+        }
+        if method == "DELETE" {
+            return self.image_delete(&decode_image_name(rest)?, query);
+        }
+        if rest.len() >= 2 {
+            let (action, name_parts) = rest.split_last().expect("rest is non-empty");
+            if !name_parts.is_empty() {
+                let name = decode_image_name(name_parts)?;
+                match (*action, method) {
+                    ("json", "GET") => return self.image_inspect(&name, query),
+                    ("history", "GET") => return self.image_history(&name, query),
+                    ("tag", "POST") => return self.image_tag(&name, query),
+                    ("get", "GET") => {
+                        return Err(ApiError::from(Error::unsupported(
+                            "image save/export is not implemented",
+                        )))
+                    }
+                    ("push", "POST") => {
+                        return Err(ApiError::from(Error::unsupported(
+                            "image push is not implemented",
+                        )))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Err(ApiError::not_found("page not found"))
+    }
+
+    fn image_list(&self, query: &Query) -> std::result::Result<Reply, ApiError> {
+        if let Some(raw) = query
+            .get("filters")
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+        {
+            let parsed: Value = serde_json::from_str(raw)
+                .map_err(|error| ApiError::bad_request(format!("invalid filters JSON: {error}")))?;
+            match parsed {
+                Value::Object(filters) if filters.is_empty() => {}
+                Value::Object(_) => {
+                    return Err(ApiError::from(Error::unsupported(
+                        "image list filters are not implemented",
+                    )))
+                }
+                _ => return Err(ApiError::bad_request("filters must be a JSON object")),
+            }
+        }
+        let store = self.image_store()?;
+        let all = query.bool_value("all", false);
+        let body: Vec<ImageSummary> = store.list(all).iter().map(ImageSummary::from).collect();
+        Ok(Reply::json(200, &body))
+    }
+
+    fn image_pull(
+        &self,
+        request: &mut Request,
+        query: &Query,
+    ) -> std::result::Result<Reply, ApiError> {
+        if query
+            .get("fromSrc")
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Err(ApiError::from(Error::unsupported(
+                "importing images from a source is not implemented",
+            )));
+        }
+        let from_image = query
+            .get("fromImage")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ApiError::bad_request("fromImage must not be empty"))?;
+        let tag = query
+            .get("tag")
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty());
+        let reference = pull_reference(from_image, tag)?;
+        let platform = query
+            .get("platform")
+            .map(str::trim)
+            .filter(|platform| !platform.is_empty());
+        let auth = registry_auth(request)?;
+        let store = self.image_store()?;
+        let result = store
+            .pull(&reference, platform, auth.as_ref())
+            .map_err(ApiError::from)?;
+        let parsed = ImageRef::parse(&reference).map_err(ApiError::from)?;
+        let (registry, repository) = canonical_registry_repo(&parsed);
+        let pull_repository = if registry == "docker.io" {
+            repository
+        } else {
+            format!("{registry}/{repository}")
+        };
+        let id = parsed
+            .digest()
+            .map(str::to_string)
+            .unwrap_or_else(|| parsed.effective_tag().to_string());
+        let status = if result.up_to_date {
+            format!("Image is up to date for {}", result.reference)
+        } else {
+            format!("Downloaded newer image for {}", result.reference)
+        };
+        let messages = [
+            ImagePullMessage::with_id(format!("Pulling from {pull_repository}"), id),
+            ImagePullMessage::status(format!("Digest: {}", result.image.manifest_digest.full())),
+            ImagePullMessage::status(format!("Status: {status}")),
+        ];
+        let mut body = Vec::new();
+        for message in &messages {
+            serde_json::to_writer(&mut body, message).map_err(|error| {
+                Error::internal(format!("failed to encode pull status: {error}"))
+            })?;
+            body.push(b'\n');
+        }
+        Ok(Reply::buffered(200, "application/json", body))
+    }
+
+    fn image_inspect(&self, name: &str, query: &Query) -> std::result::Result<Reply, ApiError> {
+        if query.bool_value("manifests", false) {
+            return Err(ApiError::from(Error::unsupported(
+                "image manifest inspection is not implemented",
+            )));
+        }
+        if query
+            .get("platform")
+            .is_some_and(|platform| !platform.trim().is_empty())
+        {
+            return Err(ApiError::from(Error::unsupported(
+                "inspecting an image for another platform is not implemented",
+            )));
+        }
+        let record = self.image_store()?.resolve(name).map_err(ApiError::from)?;
+        Ok(Reply::json(200, &ImageInspectResponse::from(&record)))
+    }
+
+    fn image_history(&self, name: &str, query: &Query) -> std::result::Result<Reply, ApiError> {
+        if query
+            .get("platform")
+            .is_some_and(|platform| !platform.trim().is_empty())
+        {
+            return Err(ApiError::from(Error::unsupported(
+                "image history for another platform is not implemented",
+            )));
+        }
+        let record = self.image_store()?.resolve(name).map_err(ApiError::from)?;
+        Ok(Reply::json(200, &history_items(&record)))
+    }
+
+    fn image_tag(&self, name: &str, query: &Query) -> std::result::Result<Reply, ApiError> {
+        let repo = query
+            .get("repo")
+            .map(str::trim)
+            .filter(|repo| !repo.is_empty())
+            .ok_or_else(|| ApiError::bad_request("repo must not be empty"))?;
+        let tag = query.get("tag").map(str::trim).unwrap_or("latest");
+        self.image_store()?
+            .tag(name, repo, tag)
+            .map_err(ApiError::from)?;
+        Ok(Reply::empty(201))
+    }
+
+    fn image_delete(&self, name: &str, query: &Query) -> std::result::Result<Reply, ApiError> {
+        let force = query.bool_value("force", false);
+        let outcome = self
+            .image_store()?
+            .delete(name, force)
+            .map_err(ApiError::from)?;
+        let mut body = Vec::with_capacity(outcome.untagged.len() + outcome.deleted.len());
+        for untagged in outcome.untagged {
+            body.push(ImageDeleteItem {
+                untagged: Some(untagged),
+                deleted: None,
+            });
+        }
+        for deleted in outcome.deleted {
+            body.push(ImageDeleteItem {
+                untagged: None,
+                deleted: Some(deleted),
+            });
+        }
+        Ok(Reply::json(200, &body))
+    }
+
     fn inspect(&self, id: &str) -> std::result::Result<Reply, ApiError> {
         let view = self.daemon.inspect(id).map_err(ApiError::from)?;
         Ok(Reply::json(200, &InspectResponse::from(&view)))
@@ -456,7 +691,13 @@ impl ApiServer {
             .filter(|name| !name.is_empty())
             .map(|name| name.trim_start_matches('/').to_string());
         let name = requested_name.unwrap_or_else(generated_name);
-        let create = dto.into_daemon(Some(name)).map_err(ApiError::from)?;
+        let image = match &self.images {
+            Some(store) => Some(store.resolve(dto.image.trim()).map_err(ApiError::from)?),
+            None => None,
+        };
+        let create = dto
+            .into_daemon_with_image(Some(name), image.as_ref().map(|record| &record.config))
+            .map_err(ApiError::from)?;
         let view = self.daemon.create(create).map_err(ApiError::from)?;
         Ok(Reply::json(
             201,
@@ -795,6 +1036,83 @@ fn read_json_body(request: &mut Request) -> std::result::Result<Vec<u8>, ApiErro
         ));
     }
     Ok(body)
+}
+
+fn pull_reference(from_image: &str, tag: Option<&str>) -> std::result::Result<String, ApiError> {
+    let Some(tag) = tag else {
+        return Ok(from_image.to_string());
+    };
+    if from_image.contains('@') {
+        return Err(ApiError::from(Error::unsupported(
+            "combining a digest-pinned fromImage with a tag is not implemented",
+        )));
+    }
+    let last = from_image.rsplit('/').next().unwrap_or(from_image);
+    if last.contains(':') {
+        if from_image.ends_with(&format!(":{tag}")) {
+            return Ok(from_image.to_string());
+        }
+        return Err(ApiError::bad_request(
+            "fromImage already contains a tag that conflicts with the tag parameter",
+        ));
+    }
+    Ok(format!("{from_image}:{tag}"))
+}
+
+fn registry_auth(request: &Request) -> std::result::Result<Option<RegistryAuth>, ApiError> {
+    let value = request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv("X-Registry-Auth"))
+        .map(|header| header.value.as_str());
+    match value {
+        Some(value) => parse_registry_auth(value).map_err(ApiError::from),
+        None => Ok(None),
+    }
+}
+
+fn decode_image_name(parts: &[&str]) -> std::result::Result<String, ApiError> {
+    let joined = parts.join("/");
+    let decoded = percent_decode_path(&joined)?;
+    let name = decoded.trim_start_matches('/');
+    if name.is_empty() {
+        return Err(ApiError::bad_request("image name must not be empty"));
+    }
+    Ok(name.to_string())
+}
+
+/// Percent-decode a path component. Unlike query parameters, `+` is a literal
+/// plus sign in URL paths.
+fn percent_decode_path(value: &str) -> std::result::Result<String, ApiError> {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err(ApiError::bad_request("invalid URL escape in image name"));
+            }
+            let high = hex_digit(bytes[index + 1])
+                .ok_or_else(|| ApiError::bad_request("invalid URL escape in image name"))?;
+            let low = hex_digit(bytes[index + 2])
+                .ok_or_else(|| ApiError::bad_request("invalid URL escape in image name"))?;
+            output.push(high << 4 | low);
+            index += 3;
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(output).map_err(|_| ApiError::bad_request("image name is not valid UTF-8"))
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn header(name: &str, value: &str) -> Header {
