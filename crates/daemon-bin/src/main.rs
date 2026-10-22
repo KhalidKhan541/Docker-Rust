@@ -9,7 +9,7 @@
 //! Start it with:
 //!
 //! ```text
-//! cargo run -p docker-rsd -- --host 127.0.0.1:2375
+//! cargo run -p docker-rsd -- --host 127.0.0.1:2375 --data-root /var/lib/docker-rs
 //! DOCKER_HOST=tcp://127.0.0.1:2375 docker ps
 //! ```
 
@@ -25,6 +25,7 @@ use docker_configuration::{DaemonConfig, FileConfig};
 use docker_daemon::{Daemon, SyntheticBehavior, SyntheticRuntime};
 use docker_errors::{Error, Result};
 use docker_events::EventBroker;
+use docker_image_store::ImageStore;
 use docker_logging::{init_daemon_tracing, DaemonLevel};
 
 const HELP: &str = "\
@@ -35,6 +36,7 @@ Usage:
 
 Options:
   --host <ADDR>          Listen address (default: DRC_API_HOST or 127.0.0.1:2375)
+  --data-root <DIR>      Image/container data root (must be writable)
   --config <FILE>        daemon.json-style configuration file
   --log-level <LEVEL>    debug | info | warn | error
   --runtime <NAME>       Run container lifecycle with the named runtime
@@ -91,8 +93,18 @@ fn run() -> Result<()> {
     if let Some(host) = options.host {
         config.api_host = host;
     }
+    if let Some(data_root) = options.data_root {
+        config.data_root = data_root;
+    }
     config.validate()?;
     init_daemon_tracing(DaemonLevel::parse(&config.log_level)?);
+    let image_root = config.data_root.join("images");
+    let images = Arc::new(ImageStore::open(image_root.clone()).map_err(|error| {
+        Error::invalid_argument(format!(
+            "cannot open image store at `{}`: {error}; pass a writable --data-root or DRC_DATA_ROOT",
+            image_root.display()
+        ))
+    })?);
 
     let runtime_name = options.runtime.unwrap_or_else(|| "synthetic".to_string());
     if runtime_name != "synthetic" {
@@ -114,15 +126,15 @@ fn run() -> Result<()> {
         synthetic: true,
         ..ServerConfig::default()
     };
-    let api = Arc::new(ApiServer::with_config(
-        daemon,
-        Arc::clone(&broker),
-        server_config,
-    )?);
+    let api = Arc::new(
+        ApiServer::with_config(daemon, Arc::clone(&broker), server_config)?
+            .with_image_store(Arc::clone(&images)),
+    );
     let server = api.serve(&listen)?;
     tracing::info!(address = %server.addr(), "docker-rsd listening");
     println!("docker-rsd listening on http://{}", server.addr());
     println!("client: DOCKER_HOST=tcp://{} docker version", server.addr());
+    println!("image store: {}", images.root().display());
     println!(
         "warning: synthetic runtime is active; container lifecycle is real, but no host process is executed"
     );
@@ -145,6 +157,7 @@ enum Command {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Options {
     host: Option<String>,
+    data_root: Option<PathBuf>,
     config: Option<PathBuf>,
     log_level: Option<String>,
     runtime: Option<String>,
@@ -179,6 +192,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Command> {
                 return Ok(Command::Version);
             }
             "--host" => options.host = Some(value("--host")?),
+            "--data-root" => options.data_root = Some(PathBuf::from(value("--data-root")?)),
             "--config" => options.config = Some(PathBuf::from(value("--config")?)),
             "--log-level" => options.log_level = Some(value("--log-level")?),
             "--runtime" => options.runtime = Some(value("--runtime")?),
@@ -242,6 +256,7 @@ mod tests {
             command,
             Command::Run(Options {
                 host: Some("127.0.0.1:2375".into()),
+                data_root: None,
                 config: Some(PathBuf::from("daemon.json")),
                 log_level: Some("debug".into()),
                 runtime: Some("synthetic".into()),
