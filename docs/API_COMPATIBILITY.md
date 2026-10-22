@@ -32,7 +32,7 @@ through `v1.51`, reject lower/unknown with a structured error, and set
 | daemon.json | daemon `config.go` | `docker-configuration::FileConfig` kebab-case, deny_unknown_fields |
 | error payloads | `moby/errdefs/http_helpers.go` | `docker-errors::http_status()`; message text returned verbatim (no `status: ` prefix) |
 
-## Implemented HTTP surface (Milestone F/G, first slice)
+## Implemented HTTP surface (Milestone F/G, container + image slice)
 
 Every response (success or error) carries `Api-Version: 1.51`. Requests may
 use an unversioned path or a `v1.24`–`v1.51` prefix; the prefix is validated
@@ -43,7 +43,7 @@ before routing. Errors use Moby's `{"message":"..."}` envelope with the
 |--------|------|--------|
 | `GET`, `HEAD` | `/_ping` | implemented; `OK`, `Server`, `OSType`, `Swarm: inactive` |
 | `GET` | `/version` | implemented; advertises API `1.51`, minimum `1.24` |
-| `GET` | `/info` | implemented from live actor state; unsupported counters are zero and the synthetic-runtime warning is explicit |
+| `GET` | `/info` | implemented from live actor/image state; image count and connectivity are real, unsupported counters are zero, and the synthetic-runtime warning is explicit |
 | `GET` | `/events` | implemented; history replay + live stream, `since`/`until`, type/container/event/label/scope filters |
 | `GET` | `/containers/json` | implemented; `all`, `limit`, status/id/name/label filters |
 | `POST` | `/containers/create` | implemented for the supported Config/HostConfig subset; optional `name`; generated name when absent |
@@ -54,6 +54,12 @@ before routing. Errors use Moby's `{"message":"..."}` envelope with the
 | `POST` | `/containers/{id}/kill` | implemented; signal name or number |
 | `POST`, `GET` | `/containers/{id}/wait` | implemented for `not-running`; returns `StatusCode`; `next-exit`/`removed` return 501 |
 | `DELETE` | `/containers/{id}` | implemented; `force` and `v` query parameters |
+| `GET` | `/images/json` | implemented; `all`; empty `filters` only (non-empty filters return 501) |
+| `POST` | `/images/create` | implemented for registry pulls (`fromImage`, `tag`, `platform`, `X-Registry-Auth` username/password); `fromSrc` and `repo`/`message` return 501 |
+| `GET` | `/images/{name}/json` | implemented; tag, repository digest, full/unique ID prefix; `manifests` and non-empty `platform` return 501 |
+| `GET` | `/images/{name}/history` | implemented from image history metadata; non-empty `platform` returns 501 |
+| `POST` | `/images/{name}/tag` | implemented; `repo` and optional `tag` |
+| `DELETE` | `/images/{name}` | implemented; `force`; untag + conservative blob GC |
 
 Short-id and name resolution happen in the single-owner container store, so
 ambiguous prefixes produce the upstream-style conflict instead of selecting
@@ -69,12 +75,40 @@ are rejected with `Unsupported` (HTTP 501) rather than silently ignored.
 Examples: bind mounts, port bindings, privileged mode, extra hosts, TTY,
 non-default logging drivers, seccomp/AppArmor options, and resource limits.
 
-Smoke-tested against the real static Docker CLI: `docker version`,
-`docker create`, `docker run -d`, `docker ps`, `docker inspect`, `docker
-start`, `docker stop`, `docker kill`, `docker rm`, `docker wait`, and
-`docker events` all drive the daemon over TCP. `docker logs`, `attach`,
-`exec`, and foreground `docker run` correctly fail with an explicit
-`Unsupported` response until the runtime captures stdio.
+When an image store is attached (the normal `docker-rsd` path), create
+resolves the image before touching the container store. A missing image
+returns Moby's `No such image` 404 instead of creating a container that
+cannot ever run. The resolved image's `Cmd`/`Entrypoint` (when the request
+left them empty), environment, labels, working directory, user, exposed
+ports, and stop signal become the container defaults; explicit container
+values win. `Env` replacement follows `docker run -e` key semantics rather
+than appending a duplicate key.
+
+Smoke-tested against the real static Docker CLI: `docker version`, `docker
+info`, `docker pull`, `docker images`, `docker image inspect`, `docker tag`,
+`docker rmi`, `docker create`, `docker run -d`, `docker ps`, `docker
+inspect`, `docker start`, `docker stop`, `docker kill`, `docker rm`, `docker
+wait`, and `docker events` all drive the daemon over TCP. `docker logs`,
+`attach`, `exec`, and foreground `docker run` correctly fail with an
+explicit `Unsupported` response until the runtime captures stdio.
+
+### Image pulls
+
+`POST /images/create` uses the distribution client, not a shell-out to
+Docker. It resolves multi-platform indexes, downloads the selected manifest,
+config, and every layer into the verified CAS, checks descriptor sizes and
+digests, and records the image by config digest. The default platform is the
+daemon host (`windows/amd64` here), so pulling Linux images on this host
+requires an explicit `platform=linux/amd64`; the failure names the available
+platforms instead of silently picking one. Loopback registries are allowed
+over plain HTTP; every other registry requires TLS. Anonymous pulls and
+Basic username/password pulls are supported. `identitytoken`/`registrytoken`
+credentials and tag-plus-digest references return `Unsupported`.
+
+The image index is `<data-root>/images/images.json`; blobs live in the
+`docker-storage` CAS below `<data-root>/images/blobs`. Records survive a
+`docker-rsd` restart. Pull progress is currently buffered into a small final
+status stream instead of being relayed live layer by layer.
 
 ### Events
 
@@ -90,9 +124,19 @@ broker; the stream uses chunked transfer encoding.
 
 ## Honest gaps in this slice
 
-- **No native image endpoints yet.** `/images/*` is not routed, so image
-  pull/list/inspect are still milestone F/G work. Container create currently
-  validates the reference syntax but does not require a materialized image.
+- **Image management is not complete.** Save/load/export, push, prune,
+  build, manifest inspection, non-empty image filters, cross-platform
+  inspect/history, and multi-tag deletion without `force` are not
+  implemented and return `Unsupported`/`Conflict` rather than pretending to
+  work. Pull progress is buffered, not streamed per layer.
+- **Images own no extracted rootfs yet.** Pull verifies and stores the
+  manifest/config/layer blobs, but layers are not unpacked into a container
+  rootfs. Container create therefore cannot run the image even if the
+  native runtime were selected; `docker-rsd` still uses the synthetic
+  runtime.
+- **Image deletion does not check container use.** Container records do not
+  yet track image references for GC, and the JSON index write is not atomic
+  on Windows. Blob GC is deliberately conservative.
 - **No process execution in the daemon binary.** `docker-rsd` wires the
   synthetic runtime: lifecycle transitions and events are real, host PIDs are
   zero, and no container process runs. The OCI backend exists and is

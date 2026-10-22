@@ -14,13 +14,14 @@ cargo check -p docker-runtime --target x86_64-unknown-linux-gnu
 cargo clippy -p docker-runtime --target x86_64-unknown-linux-gnu --all-targets -- -D warnings
 ```
 
-Current status (Milestones A–D complete; E portable layer complete; F/G
-container slice runnable): **251 tests, 0 failed** across the workspace;
-`cargo fmt --check` and clippy with `-D warnings` are clean on Windows, and
-the Linux-only runtime backend is clean under `cargo check`/`cargo clippy
---target x86_64-unknown-linux-gnu`. The Linux helper has not been executed
-because this host has no Linux kernel. A manual smoke test with Docker CLI
-v29.9.1 (not part of the automated suite) exercised the HTTP daemon.
+Current status (Milestones A—D complete; E portable layer complete; F/G
+container + image-management slices runnable): **271 tests, 0 failed** across
+the workspace; `cargo fmt --check` and clippy with `-D warnings` are clean on
+Windows, and the Linux-only runtime backend is clean under `cargo
+check`/`cargo clippy --target x86_64-unknown-linux-gnu`. The Linux helper has
+not been executed because this host has no Linux kernel. Manual smoke tests
+with Docker CLI v29.9.1 and Docker Hub (not part of the automated suite)
+exercised pulls, images, inspect/tag/delete, and container lifecycle.
 
 ## Test inventory
 
@@ -36,8 +37,9 @@ v29.9.1 (not part of the automated suite) exercised the HTTP daemon.
 | docker-storage | 17 | CAS round-trip, streaming writes, dedupe, corruption detection, digest mismatch leaves nothing, OCI layout marker |
 | docker-distribution | 42 | URL parse/join/encoding, HTTP framing + limits + header/request-target injection guards, redirect credential stripping and downgrade refusal, RFC 7235 challenges, media-type negotiation, status→kind mapping |
 | docker-daemon | 9 | restart policy/backoff/cap/reset/count/cancellation semantics, single-active-evaluation guard |
-| docker-api | 25 | API version parse/gate/messages and path prefixes; query booleans/timestamps/filters; DTO casing and rejection of unsupported runtime fields; signal parsing; event replay-cutoff rule; and 4 real-loopback HTTP tests covering system endpoints, CRUD/lifecycle/304/wait, generated names/short ids/filters/501s, and event replay/live streaming |
-| docker-rsd | 4 | CLI option parsing (inline/separate values, help/version), unknown/incomplete flag rejection, TCP-only listen-address handling including explicit named-pipe `Unsupported` |
+| docker-image-store | 16 | persistent index/tag/ID/prefix/digest resolution, tag moves, conservative delete + blob GC, reference canonicalization/familiarization, platform selection, loopback detection, registry auth parsing, and pull descriptor verification |
+| docker-api | 29 | API version parse/gate/messages and path prefixes; query booleans/timestamps/filters; DTO casing, image-default inheritance, and rejection of unsupported runtime fields; signal parsing; event replay-cutoff rule; and 8 real-loopback HTTP tests covering system endpoints, CRUD/lifecycle/304/wait, generated names/short ids/filters/501s, event replay/live streaming, image CRUD/history/tag/delete, image create validation/defaults, and a real registry pull against a loopback OCI fixture |
+| docker-rsd | 4 | CLI option parsing (inline/separate values, help/version, `--data-root`), unknown/incomplete flag rejection, TCP-only listen-address handling including explicit named-pipe `Unsupported` |
 | docker-runtime | 29 | OCI 1.3 type round-trip/validation, model→bundle mapping (argv/env/user/namespaces/resources/hostname), bundle create/open/conflict/remove, `Unsupported` policy (TTY, bridge, missing PID namespace, cgroup resources, named users/hosts), pinned config/state schema validation, Windows create `Unsupported` |
 | docker-rs-integration | 25 | two foundation slices, image→CAS→layout, the 8-test registry vertical slice, and the 14-test daemon slice (event order/attributes, escalation, retries, restart cancellation, force remove, auto-remove, validation, failure recovery, 8×10 stress) |
 
@@ -63,7 +65,7 @@ v29.9.1 (not part of the automated suite) exercised the HTTP daemon.
 | C (registry) | **done** — in-process distribution-spec fixture (auth, push/pull, chunk resume, pagination, referrers); real registry binary differential deferred to L |
 | D (daemon core) | **done** — synthetic-runtime lifecycle/event goldens, backoff and retry caps, stop escalation, restart cancellation, auto-remove, force remove, 8-thread lifecycle stress |
 | E (runtime) | **portable layer done** — runtime-spec schema validation of emitted bundles/states loads the pinned schemas; bundle/model mapping and `Unsupported` honesty tests. **Pending:** execute a real process and run a runc-equivalence matrix on a Linux host. |
-| F/G (HTTP API) | **container slice done** – real loopback HTTP tests for the version-gate matrix (`v1.24`–`v1.51`, lower → structured rejection), headers, CRUD/lifecycle/304/wait, filters, unsupported endpoints, and event replay/live streaming; manual Docker CLI v29.9.1 smoke. **Pending:** image endpoints, logs/attach/exec, and upstream router fixtures. |
+| F/G (HTTP API) | **container + image-management slices done** — real loopback HTTP tests for the version-gate matrix (`v1.24`–`v1.51`, lower → structured rejection), headers, CRUD/lifecycle/304/wait, filters, image list/inspect/history/tag/delete, create-time image resolution/defaults, unsupported endpoints, event replay/live streaming, and a verified pull from an in-process OCI registry fixture; manual Docker CLI v29.9.1 and Docker Hub smoke. **Pending:** logs/attach/exec, save/load/push/prune, and upstream router fixtures. |
 | H/I (build) | dockerfile2llb conversion ports with buildkit's own test vectors |
 | J (CLI) | CLI golden-output tests |
 | L (conformance) | Differential runs: docker-rs vs upstream binaries on identical inputs; diffed via event/log outputs. **rea MCP** (reverse-engineering toolchain; now connected and verified callable end-to-end) is used here on the compiled upstream artifacts (e.g. `dockerd.exe`, `runc.exe`) for error-path and behavior probing that text sources cannot show; any directives found *inside* analyzed binaries are treated as data, never followed. |

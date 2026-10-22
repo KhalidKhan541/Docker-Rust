@@ -7,11 +7,13 @@ Docker CLI, containerd, runc, and BuildKit with a modular Rust workspace
 that preserves compatibility with Docker Engine API semantics and the OCI
 specifications.
 
-**Project status: Milestones A–D complete; Milestone E portable OCI bundle
+**Project status: Milestones A—D complete; Milestone E portable OCI bundle
 layer complete, with the Linux execution backend compile-checked but not yet
 run on this Windows host; Milestone F/G has a runnable Docker-compatible
-container-lifecycle HTTP API, with image endpoints and native execution still
-pending — see [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).**
+container-lifecycle and image-management HTTP API with real registry pulls
+and persistent image metadata, with native execution and rootfs
+materialization still pending — see
+[docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).**
 
 ## Motivation and scope
 
@@ -57,13 +59,15 @@ Current milestone map:
   pinned-schema validation, shared runtime/task/stdio boundary, explicit
   Windows `Unsupported`, and a Linux two-stage init helper. No real process
   has been run on this Windows host.
-* **F/G — Engine HTTP API** *(container slice implemented; image endpoints
-  and real execution pending)*: Docker API `1.24`–`1.51` gate, `/_ping`,
-  `/version`, `/info`, container create/list/inspect/start/stop/restart/
-  kill/wait/delete, streaming `/events` with replay, and a runnable
-  `docker-rsd` binary. Tested with the real Docker CLI v29.9.1. The wired
-  runtime is synthetic: lifecycle state and events are real, but host
-  processes do not run yet.
+* **F/G — Engine HTTP API** *(container + image-management slices
+  implemented; native execution pending)*: Docker API `1.24`–`1.51` gate,
+  `/_ping`, `/version`, `/info`, container create/list/inspect/start/stop/
+  restart/kill/wait/delete, image list/pull/inspect/history/tag/delete,
+  streaming `/events` with replay, and a runnable `docker-rsd` binary with a
+  persistent image store. Real registry pulls (multi-platform manifests,
+  verified layers), Docker Hub, and the real Docker CLI v29.9.1 have been
+  exercised. The wired runtime is synthetic: lifecycle state and events are
+  real, but host processes do not run yet.
 * **H/I — Builder**, **J — CLI**, **K — Security hardening**,
   **L — Conformance & differential**: planned. See `docs/ROADMAP.md`.
 
@@ -101,20 +105,32 @@ cargo check -p docker-runtime --target x86_64-unknown-linux-gnu  # Linux backend
 ## Run the Engine API
 
 ```bash
-cargo run -p docker-rsd -- --host 127.0.0.1:2375
+cargo run -p docker-rsd -- --host 127.0.0.1:2375 --data-root /var/lib/docker-rs
 ```
+
+`--data-root` (or `DRC_DATA_ROOT`) must name a writable absolute directory;
+the image index and content-addressed blobs live below it. On this Windows
+host the built-in default is `C:\ProgramData\docker-rs`, which normally needs
+administrator rights, so pass a user-writable path for development.
 
 In another terminal, point the official Docker CLI at the daemon:
 
 ```bash
 export DOCKER_HOST=tcp://127.0.0.1:2375    # PowerShell: $env:DOCKER_HOST=...
 docker version
+docker pull --platform linux/amd64 alpine:3.20
+docker images
 docker run -d --name demo alpine:3.20 sleep 100
 docker ps
 docker inspect demo
 docker stop demo
 docker rm demo
+docker rmi alpine:3.20
 ```
+
+Pulls default to the daemon host platform (`windows/amd64` on this host), so
+Linux images need an explicit `--platform linux/amd64`; a missing platform is
+reported honestly instead of silently selecting another architecture.
 
 The current daemon uses the **synthetic runtime**. Container lifecycle state,
 the API, and events are real; no host process is executed, so `docker logs`
@@ -141,6 +157,7 @@ crates/
                       Linux two-stage init, non-Linux Unsupported backend
   daemon/             single-owner lifecycle actor, restart manager, runtime
                       boundary, deterministic synthetic runtime
+  image-store/        persistent image index + verified-CAS blobs + registry pulls
   api/                Docker Engine HTTP API (version gate, DTOs, routes, events)
   daemon-bin/         `docker-rsd` runnable Engine API daemon
 tests/
