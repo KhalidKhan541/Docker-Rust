@@ -7,10 +7,12 @@
 
 #![forbid(unsafe_code)]
 
+pub mod archive;
 pub mod pull;
 pub mod reference;
 pub mod store;
 
+pub use archive::{LoadOutcome, LoadedImage};
 pub use pull::{parse_registry_auth, PullResult, RegistryAuth};
 pub use reference::{
     canonical_registry_repo, canonical_repo_digest, canonical_tag, canonical_tag_from_parts,
