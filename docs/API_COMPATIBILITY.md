@@ -60,6 +60,9 @@ before routing. Errors use Moby's `{"message":"..."}` envelope with the
 | `GET` | `/images/{name}/history` | implemented from image history metadata; non-empty `platform` returns 501 |
 | `POST` | `/images/{name}/tag` | implemented; `repo` and optional `tag` |
 | `DELETE` | `/images/{name}` | implemented; `force`; untag + conservative blob GC |
+| `GET` | `/images/get?names=...` | implemented; OCI layout + legacy `manifest.json`, optional `platform` |
+| `GET` | `/images/{name}/get` | implemented; same archive writer as `/images/get` |
+| `POST` | `/images/load` | implemented; OCI or legacy Docker archive, plain/gzip tar, optional `platform`, newline-delimited JSON status stream |
 
 Short-id and name resolution happen in the single-owner container store, so
 ambiguous prefixes produce the upstream-style conflict instead of selecting
@@ -110,6 +113,41 @@ The image index is `<data-root>/images/images.json`; blobs live in the
 `docker-rsd` restart. Pull progress is currently buffered into a small final
 status stream instead of being relayed live layer by layer.
 
+### Image save and load
+
+`GET /images/get` and `GET /images/{name}/get` write the archive format
+produced by current Moby: an OCI layout (`oci-layout`, `index.json`,
+`blobs/sha256/...`) plus the legacy `manifest.json` compatibility file.
+Layer blobs are copied byte-for-byte from the verified CAS, so compressed
+layers keep their original digests and Moby's loader can decompress them.
+`index.json` descriptors are annotated with the canonical image name and tag;
+`manifest.json` carries familiar `RepoTags`, the config path, and layer paths.
+Repeat the `names` query parameter to export multiple images. A tag, image ID,
+or digest selects one image; a bare repository exports every matching tag.
+No names returns HTTP 400.
+
+`POST /images/load` accepts either the OCI-layout archive or a legacy Docker
+archive, as an uncompressed tar or a gzip-compressed tar. It validates every
+manifest/config/layer digest and rootfs diffID before committing blobs, then
+restores tags, IDs, sizes, labels, and platform metadata. Success responses are
+newline-delimited `{"stream":"Loaded image: ..."}` messages (or `Loaded image
+ID:` for an untagged image). Archives are spooled to a temporary file; request
+bodies are capped at 64 GiB. Extraction rejects absolute paths, `..`, symlinks,
+hardlinks, and device nodes, and is bounded to 100,000 entries and 64 GiB.
+Zstd-compressed archives return an explicit `Unsupported` error because no zstd
+decoder is linked yet.
+
+`platform` is an OCI platform JSON object (for example
+`{"architecture":"amd64","os":"linux"}`), not `os/arch`. Save rejects a
+platform that does not match the selected image; load skips manifests that do
+not match and fails if none remain. Repeating `platform` returns HTTP 400.
+Save is spooled before the response and is not a true live stream yet. Neither
+path extracts a rootfs; layers remain verified archive blobs.
+
+Manual smoke testing with Docker CLI v29.9.1 exercised `docker save` (single
+and multiple names), `docker load`, and gzip-compressed archives against
+`docker-rsd`.
+
 ### Events
 
 `EventBroker` keeps a bounded replay window (4096 events by default). The
@@ -124,11 +162,12 @@ broker; the stream uses chunked transfer encoding.
 
 ## Honest gaps in this slice
 
-- **Image management is not complete.** Save/load/export, push, prune,
-  build, manifest inspection, non-empty image filters, cross-platform
-  inspect/history, and multi-tag deletion without `force` are not
-  implemented and return `Unsupported`/`Conflict` rather than pretending to
-  work. Pull progress is buffered, not streamed per layer.
+- **Image management is not complete.** Push, prune, build, manifest
+  inspection, non-empty image filters, cross-platform inspect/history, and
+  multi-tag deletion without `force` are not implemented and return
+  `Unsupported`/`Conflict` rather than pretending to work. Save/load are
+  implemented but spooled to temporary files instead of streaming directly.
+  Pull progress is buffered, not streamed per layer.
 - **Images own no extracted rootfs yet.** Pull verifies and stores the
   manifest/config/layer blobs, but layers are not unpacked into a container
   rootfs. Container create therefore cannot run the image even if the

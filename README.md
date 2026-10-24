@@ -10,9 +10,9 @@ specifications.
 **Project status: Milestones A—D complete; Milestone E portable OCI bundle
 layer complete, with the Linux execution backend compile-checked but not yet
 run on this Windows host; Milestone F/G has a runnable Docker-compatible
-container-lifecycle and image-management HTTP API with real registry pulls
-and persistent image metadata, with native execution and rootfs
-materialization still pending — see
+container-lifecycle, image-management, and image-save/load HTTP API with real
+registry pulls and persistent image metadata, with native execution and
+rootfs materialization still pending — see
 [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).**
 
 ## Motivation and scope
@@ -59,15 +59,16 @@ Current milestone map:
   pinned-schema validation, shared runtime/task/stdio boundary, explicit
   Windows `Unsupported`, and a Linux two-stage init helper. No real process
   has been run on this Windows host.
-* **F/G — Engine HTTP API** *(container + image-management slices
+* **F/G — Engine HTTP API** *(container + image-management + archive slices
   implemented; native execution pending)*: Docker API `1.24`–`1.51` gate,
   `/_ping`, `/version`, `/info`, container create/list/inspect/start/stop/
   restart/kill/wait/delete, image list/pull/inspect/history/tag/delete,
+  image save/load (`/images/get`, `/images/{name}/get`, `/images/load`),
   streaming `/events` with replay, and a runnable `docker-rsd` binary with a
   persistent image store. Real registry pulls (multi-platform manifests,
-  verified layers), Docker Hub, and the real Docker CLI v29.9.1 have been
-  exercised. The wired runtime is synthetic: lifecycle state and events are
-  real, but host processes do not run yet.
+  verified layers), Docker Hub, Docker save/load archives, and the real
+  Docker CLI v29.9.1 have been exercised. The wired runtime is synthetic:
+  lifecycle state and events are real, but host processes do not run yet.
 * **H/I — Builder**, **J — CLI**, **K — Security hardening**,
   **L — Conformance & differential**: planned. See `docs/ROADMAP.md`.
 
@@ -120,6 +121,8 @@ export DOCKER_HOST=tcp://127.0.0.1:2375    # PowerShell: $env:DOCKER_HOST=...
 docker version
 docker pull --platform linux/amd64 alpine:3.20
 docker images
+docker save -o alpine.tar alpine:3.20
+docker load -i alpine.tar
 docker run -d --name demo alpine:3.20 sleep 100
 docker ps
 docker inspect demo
@@ -158,6 +161,7 @@ crates/
   daemon/             single-owner lifecycle actor, restart manager, runtime
                       boundary, deterministic synthetic runtime
   image-store/        persistent image index + verified-CAS blobs + registry pulls
+                      + Docker/OCI save-load archives
   api/                Docker Engine HTTP API (version gate, DTOs, routes, events)
   daemon-bin/         `docker-rsd` runnable Engine API daemon
 tests/

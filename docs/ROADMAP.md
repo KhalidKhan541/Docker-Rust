@@ -114,22 +114,24 @@ Implemented: API 1.24–1.51 gate and `/vX.Y` prefixes; `/_ping`, `/version`,
 with names and short ids; 304 start/stop semantics; list filters; image
 list/pull/inspect/history/tag/delete backed by a persistent store and real
 distribution client, including multi-platform selection and verified layer
-downloads; create-time image resolution and image default inheritance;
+downloads; Docker/OCI save/load (`/images/get`, `/images/{name}/get`,
+`/images/load`) with legacy `manifest.json`, gzip input, and platform
+filtering; create-time image resolution and image default inheritance;
 `/events` history replay + live stream; Docker-cased DTOs with explicit
 rejection of unsupported fields; synchronous `tiny_http` transport; runnable
 `docker-rsd` binary over TCP with `--data-root`. Verified with curl-level
 integration tests, an in-process registry fixture, a live Docker Hub pull,
-and a manual Docker CLI v29.9.1 smoke test.
+and a manual Docker CLI v29.9.1 smoke test including save/load.
 
-Still pending: save/load/push/prune, image filters, `/logs`, attach/exec
-hijack, stats/top, network and volume endpoints, image-rootfs
-materialization, and native execution in the daemon binary. Container state
-is in-memory only; image metadata and blobs persist.
+Still pending: push/prune, image filters, `/logs`, attach/exec hijack,
+stats/top, network and volume endpoints, image-rootfs materialization, and
+native execution in the daemon binary. Container state is in-memory only;
+image metadata and blobs persist.
 
 Exit criterion partially met: curl/Docker-CLI container lifecycle and image
-pull/list/inspect/tag/delete work over HTTP, the version-gate matrix is
-green, and error payloads use upstream message conventions. Full endpoint
-and error-payload conformance is milestone L.
+pull/list/inspect/tag/delete/save/load work over HTTP, the version-gate
+matrix is green, and error payloads use upstream message conventions. Full
+endpoint and error-payload conformance is milestone L.
 
 ## H/I — Builder (`docker-buildkit`)
 Dockerfile frontend: instruction parsing → DAG (LLB-equivalent) →

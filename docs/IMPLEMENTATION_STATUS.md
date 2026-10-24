@@ -2,10 +2,10 @@
 
 Snapshot: Milestones A—D complete; Milestone E portable layer complete and the
 Linux execution backend compile-checked but not runnable on this host;
-Milestone F/G has a runnable container-lifecycle and image-management HTTP API
-plus a daemon binary. Registry pulls are real and persistent; native process
-execution and rootfs materialization are still pending. Honest state of every
-layer.
+Milestone F/G has a runnable container-lifecycle, image-management, and
+image-archive HTTP API plus a daemon binary. Registry pulls and Docker
+save/load are real and persistent; native process execution and rootfs
+materialization are still pending. Honest state of every layer.
 
 ## Milestone status
 
@@ -16,7 +16,7 @@ layer.
 | C | Registry (distribution client) | **done** | 168 tests green (42 distribution unit + 8 registry integration added); fmt/clippy `-D warnings` clean |
 | D | Daemon core (containerd-equivalent orchestration) | **done** | 191 tests green (9 daemon unit + 14 daemon integration added); fmt/clippy `-D warnings` clean; actor + synthetic runtime |
 | E | OCI runtime (container execution) | **in progress** | 220 tests green (25 runtime unit + 4 runtime integration tests added); fmt/clippy clean on Windows and `x86_64-unknown-linux-gnu`; bundle generation + deterministic Windows `Unsupported` tested; Linux init helper compile-checked, not executed on this Windows host |
-| F/G | Engine HTTP API | **in progress — container + image slices runnable** | 271 workspace tests green (21 `docker-api` unit + 8 loopback HTTP integration + 4 `docker-rsd` unit + 16 `docker-image-store` unit); fmt/clippy `-D warnings` clean; real Docker CLI v29.9.1 and Docker Hub pull smoke tests over TCP; native process execution/rootfs pending |
+| F/G | Engine HTTP API | **in progress — container + image + archive slices runnable** | 276 workspace tests green (21 `docker-api` unit + 9 loopback HTTP integration + 4 `docker-rsd` unit + 20 `docker-image-store` unit); fmt/clippy `-D warnings` clean; real Docker CLI v29.9.1 pull/save/load and Docker Hub smoke tests over TCP; native process execution/rootfs pending |
 | H/I | Builder (buildkit-equivalent) | not started | dockerfile2llb module verified in pinned tree |
 | J | CLI | not started | `upstream/cli/cmd/docker/` verified |
 | K | Security hardening | not started | SECURITY_ANALYSIS.md review hooks defined |
@@ -82,18 +82,19 @@ success.
 
 | Crate | Contents |
 |-------|----------|
-| `docker-api` | `version.rs`: API `1.24`–`1.51` gate with upstream-compatible too-old/too-new messages and `/vX.Y` path-prefix parsing. `dto.rs`: explicit Moby-cased wire DTOs for version/info/create/list/inspect, conversion to the internal model, image-default inheritance, and rejection of non-empty unsupported fields. `image_dto.rs`: Docker image summary/inspect/history/pull/delete wire shapes. `query.rs`: query decoding with Docker boolean semantics, timestamp parsing, list/event filters, and explicit rejection of unimplemented filters. `server.rs`: synchronous `tiny_http` transport over the daemon actor and image store; `/_ping`, `/version`, `/info`, container CRUD/lifecycle/wait, image list/pull/inspect/history/tag/delete, and `/events`; shared `Api-Version` headers and `{"message":...}` errors; Moby `304` start/stop semantics; chunked live event streaming. |
-| `docker-image-store` | Persistent `<data-root>/images/images.json` reference index plus verified-CAS blobs. Canonical/familiar Docker reference normalization, tag/repository-digest canonical keys, ID/prefix/tag/digest resolution, tag moves, conservative untag/delete + blob GC, direct manifest pulls through `docker-distribution`, multi-platform index selection, config/layer descriptor size and digest verification, host-platform default, loopback plain-HTTP registries, and Basic/anonymous `X-Registry-Auth` parsing. |
+| `docker-api` | `version.rs`: API `1.24`–`1.51` gate with upstream-compatible too-old/too-new messages and `/vX.Y` path-prefix parsing. `dto.rs`: explicit Moby-cased wire DTOs for version/info/create/list/inspect, conversion to the internal model, image-default inheritance, and rejection of non-empty unsupported fields. `image_dto.rs`: Docker image summary/inspect/history/pull/load/delete wire shapes. `query.rs`: query decoding with Docker boolean semantics, timestamp parsing, list/event filters, and explicit rejection of unimplemented filters. `server.rs`: synchronous `tiny_http` transport over the daemon actor and image store; `/_ping`, `/version`, `/info`, container CRUD/lifecycle/wait, image list/pull/inspect/history/tag/delete, `/images/get`, `/images/{name}/get`, `/images/load`, and `/events`; 64 GiB archive spooling, OCI-platform query decoding, newline-delimited load status; shared `Api-Version` headers and `{"message":...}` errors; Moby `304` start/stop semantics; chunked live event streaming. |
+| `docker-image-store` | Persistent `<data-root>/images/images.json` reference index plus verified-CAS blobs. Canonical/familiar Docker reference normalization, tag/repository-digest canonical keys, ID/prefix/tag/digest resolution, tag moves, conservative untag/delete + blob GC, direct manifest pulls through `docker-distribution`, multi-platform index selection, config/layer descriptor size and digest verification, host-platform default, loopback plain-HTTP registries, and Basic/anonymous `X-Registry-Auth` parsing. `archive.rs` writes OCI layout plus legacy `manifest.json`, copies verified layer blobs, and imports OCI or legacy plain/gzip tar archives with path-traversal guards, entry/byte limits, digest/diffID verification, gzip support, and tag restoration. |
 | `docker-rsd` | Runnable daemon binary. Resolves `daemon.json`-style config and `DRC_*` environment overrides, initializes tracing, opens the image store, constructs the broker/synthetic runtime/actor, and serves the API on `--host` (default loopback `127.0.0.1:2375`). `--data-root`/`DRC_DATA_ROOT` selects the persistent image root. It deliberately rejects non-synthetic runtimes until a rootfs provider is connected, and rejects `npipe://`/`unix://` instead of pretending they work. |
 | `docker-events` | Bounded replay history (4096 events by default), atomic history-snapshot + subscribe (`subscribe_since`), `history_len`, `recv_timeout`, and lowercase action serialization matching Moby's wire JSON. |
 | `docker-container-model` / `docker-daemon` | `created_at` on records and `started_at`/`finished_at` on state snapshots, populated by actor lifecycle transitions and exposed through inspect/list. |
-| Tests | `crates/api/tests/http_api.rs`: a real loopback TCP client (Content-Length and chunked decoding) exercises version gates/headers, create/list/inspect/start/stop/restart/kill/wait/delete, generated names, short ids, filters, image defaults/create validation, image list/inspect/history/tag/delete, unsupported fields/endpoints, event replay/live streaming, and a real pull against an in-process loopback OCI registry fixture. `docker-image-store` unit tests cover persistence, resolution, delete/GC, reference canonicalization, platform selection, auth parsing, and pull verification. `docker-rsd` unit tests cover option parsing and explicit named-pipe rejection. Manual differential smoke tests used the pinned Docker CLI v29.9.1 against `docker-rsd` and pulled `alpine:3.20` from Docker Hub. |
+| Tests | `crates/api/tests/http_api.rs`: a real loopback TCP client (Content-Length and chunked decoding) exercises version gates/headers, create/list/inspect/start/stop/restart/kill/wait/delete, generated names, short ids, filters, image defaults/create validation, image list/inspect/history/tag/delete, image save/load round-trip (OCI + legacy, gzip, platform filters), unsupported fields/endpoints, event replay/live streaming, and a real pull against an in-process loopback OCI registry fixture. `docker-image-store` unit tests cover persistence, resolution, delete/GC, reference canonicalization, platform selection, auth parsing, pull verification, archive export, legacy/gzip import, tag restoration, and traversal rejection. `docker-rsd` unit tests cover option parsing and explicit named-pipe rejection. Manual differential smoke tests used the pinned Docker CLI v29.9.1 against `docker-rsd`, pulled `alpine:3.20` from Docker Hub, and exercised `docker save`/`docker load`. |
 
 What the real Docker CLI successfully exercised over
 `DOCKER_HOST=tcp://127.0.0.1:<port>`: `version`, `info`, `pull --platform
 linux/amd64`, `images`, `image inspect`, `tag`, `rmi`, `create`, `run -d`,
-`ps`, `inspect`, `start`, `stop`, `kill`, `rm`, `wait`, and `events`.
-`logs` fails with the explicit 501 unsupported message, as expected. A pull
+`ps`, `inspect`, `start`, `stop`, `kill`, `rm`, `wait`, `events`, `save`, and
+`load` (including gzip archives). `logs` fails with the explicit 501
+unsupported message, as expected. A pull
 without `--platform` honestly reports that the `windows/amd64` image is not
 present in Alpine's manifest list and lists the available platforms.
 
@@ -120,12 +121,13 @@ present in Alpine's manifest list and lists the available platforms.
   endpoints are routed. Container create resolves the image record and inherits
   its execution defaults, but no code path has yet materialized an image rootfs
   for execution.
-- Image management is partial: no save/load/export, push, prune, build,
-  manifest inspection, non-empty image filters, cross-platform inspect/history,
-  or multi-tag deletion without `force`; those paths return explicit
-  `Unsupported`/`Conflict` errors. Pull progress is buffered into a final
-  summary, image deletion does not yet check container use, and the JSON index
-  rename is not atomic on Windows.
+- Image management is partial: save/load exist, but there is no push, prune,
+  build, manifest inspection, non-empty image filters, cross-platform
+  inspect/history, or multi-tag deletion without `force`; those paths return
+  explicit `Unsupported`/`Conflict` errors. Save/load spool archives through
+  temporary files rather than streaming end to end. Pull progress is buffered
+  into a final summary, image deletion does not yet check container use, and
+  the JSON index rename is not atomic on Windows.
 - `docker-rsd` serves the synthetic runtime. HTTP lifecycle behavior and
   events are real, but no host process runs, `State.Pid` is zero, and logs
   cannot exist. Foreground `docker run`/`docker attach` is therefore not
