@@ -194,6 +194,13 @@ impl ImagePullMessage {
     }
 }
 
+/// One `POST /images/load` JSON stream line. Docker's CLI renders the
+/// `stream` text verbatim.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImageLoadMessage {
+    pub stream: String,
+}
+
 /// `DELETE /images/{name}` item (`image.DeleteResponse`).
 #[derive(Debug, Clone, Serialize)]
 pub struct ImageDeleteItem {

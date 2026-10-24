@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
-use std::io::{self, Cursor, Read};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -20,6 +20,7 @@ use docker_container_model::config::Signal;
 use docker_container_model::state::LifecycleState;
 use docker_errors::{Error, Result};
 use docker_events::{Event, EventBroker, Subscription};
+use docker_image::Platform;
 use docker_image_store::{canonical_registry_repo, parse_registry_auth, ImageStore, RegistryAuth};
 use serde::Serialize;
 use serde_json::Value;
@@ -31,10 +32,15 @@ use crate::dto::{
     WaitResponse, MAX_BODY_BYTES,
 };
 use crate::image_dto::{
-    history_items, ImageDeleteItem, ImageInspectResponse, ImagePullMessage, ImageSummary,
+    history_items, ImageDeleteItem, ImageInspectResponse, ImageLoadMessage, ImagePullMessage,
+    ImageSummary,
 };
 use crate::query::{ContainerListOptions, EventFilters, EventOptions, Query};
 use crate::version::{self, VersionDecision, VersionGate, VersionUnsupported};
+
+/// Upper bound for an imported image archive. The body is spooled to a
+/// temporary file, so this is a disk bound rather than a memory bound.
+const MAX_IMAGE_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 /// API server configuration. The version strings are exposed as fields so a
 /// future embedder can advertise a narrowed range without changing routes.
@@ -270,9 +276,8 @@ impl ApiServer {
             ["images", "search"] if method == "GET" => Err(ApiError::from(Error::unsupported(
                 "image search is not implemented",
             ))),
-            ["images", "load"] if method == "POST" => Err(ApiError::from(Error::unsupported(
-                "image load is not implemented",
-            ))),
+            ["images", "get"] if method == "GET" => self.image_save(&query),
+            ["images", "load"] if method == "POST" => self.image_load(request, &query),
             ["images", rest @ ..] => self.route_image(method, rest, &query),
             _ => Err(ApiError::not_found("page not found")),
         }
@@ -506,11 +511,7 @@ impl ApiServer {
                     ("json", "GET") => return self.image_inspect(&name, query),
                     ("history", "GET") => return self.image_history(&name, query),
                     ("tag", "POST") => return self.image_tag(&name, query),
-                    ("get", "GET") => {
-                        return Err(ApiError::from(Error::unsupported(
-                            "image save/export is not implemented",
-                        )))
-                    }
+                    ("get", "GET") => return self.image_save_named(&name, query),
                     ("push", "POST") => {
                         return Err(ApiError::from(Error::unsupported(
                             "image push is not implemented",
@@ -545,6 +546,72 @@ impl ApiServer {
         let all = query.bool_value("all", false);
         let body: Vec<ImageSummary> = store.list(all).iter().map(ImageSummary::from).collect();
         Ok(Reply::json(200, &body))
+    }
+
+    fn image_save(&self, query: &Query) -> std::result::Result<Reply, ApiError> {
+        let names: Vec<String> = query.get_all("names").map(str::to_string).collect();
+        self.image_save_names(&names, query)
+    }
+
+    fn image_save_named(&self, name: &str, query: &Query) -> std::result::Result<Reply, ApiError> {
+        self.image_save_names(&[name.to_string()], query)
+    }
+
+    fn image_save_names(
+        &self,
+        names: &[String],
+        query: &Query,
+    ) -> std::result::Result<Reply, ApiError> {
+        let platform = decode_platform(query)?;
+        let mut archive = tempfile::tempfile().map_err(|error| {
+            ApiError::from(Error::internal(format!(
+                "failed to create image archive spool: {error}"
+            )))
+        })?;
+        self.image_store()?
+            .export_archive(names, platform.as_ref(), &mut archive)
+            .map_err(ApiError::from)?;
+        archive.seek(SeekFrom::Start(0)).map_err(|error| {
+            ApiError::from(Error::internal(format!(
+                "failed to rewind image archive: {error}"
+            )))
+        })?;
+        Ok(Reply::stream("application/x-tar", Box::new(archive)))
+    }
+
+    fn image_load(
+        &self,
+        request: &mut Request,
+        query: &Query,
+    ) -> std::result::Result<Reply, ApiError> {
+        let platform = decode_platform(query)?;
+        let mut archive = tempfile::tempfile().map_err(|error| {
+            ApiError::from(Error::internal(format!(
+                "failed to create image load spool: {error}"
+            )))
+        })?;
+        copy_request_body(request, &mut archive, MAX_IMAGE_ARCHIVE_BYTES)?;
+        archive.seek(SeekFrom::Start(0)).map_err(|error| {
+            ApiError::from(Error::internal(format!(
+                "failed to rewind image load spool: {error}"
+            )))
+        })?;
+        let outcome = self
+            .image_store()?
+            .load_archive(&mut archive, platform.as_ref())
+            .map_err(ApiError::from)?;
+
+        let mut body = Vec::new();
+        for image in outcome.images {
+            if image.tags.is_empty() {
+                push_load_message(&mut body, format!("Loaded image ID: {}\n", image.id.full()))?;
+            } else {
+                for tag in image.tags {
+                    push_load_message(&mut body, format!("Loaded image: {tag}\n"))?;
+                }
+            }
+        }
+        Ok(Reply::buffered(200, "application/json", body))
     }
 
     fn image_pull(
@@ -988,6 +1055,63 @@ fn parse_signal(raw: &str) -> std::result::Result<Signal, ApiError> {
             "signal {number} is not supported"
         ))),
     }
+}
+
+fn decode_platform(query: &Query) -> std::result::Result<Option<Platform>, ApiError> {
+    let values: Vec<&str> = query.get_all("platform").collect();
+    if values.len() > 1 {
+        return Err(ApiError::bad_request(
+            "multiple platform parameters not supported",
+        ));
+    }
+    let Some(raw) = values.first().copied() else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    let platform: Platform = serde_json::from_str(raw)
+        .map_err(|error| ApiError::bad_request(format!("failed to parse platform: {error}")))?;
+    if platform.os.is_empty() || platform.architecture.is_empty() {
+        return Err(ApiError::bad_request(
+            "both OS and Architecture must be provided",
+        ));
+    }
+    Ok(Some(platform))
+}
+
+fn copy_request_body(
+    request: &mut Request,
+    output: &mut std::fs::File,
+    limit: u64,
+) -> std::result::Result<u64, ApiError> {
+    if let Some(length) = request.body_length() {
+        if length as u64 > limit {
+            return Err(ApiError {
+                status: 413,
+                message: format!("request body exceeds {limit} bytes"),
+            });
+        }
+    }
+    let copied = io::copy(&mut request.as_reader().take(limit + 1), output)
+        .map_err(|error| ApiError::bad_request(format!("failed to read request body: {error}")))?;
+    if copied > limit {
+        return Err(ApiError {
+            status: 413,
+            message: format!("request body exceeds {limit} bytes"),
+        });
+    }
+    if copied == 0 {
+        return Err(ApiError::bad_request("request body is empty"));
+    }
+    Ok(copied)
+}
+
+fn push_load_message(body: &mut Vec<u8>, stream: String) -> std::result::Result<(), ApiError> {
+    serde_json::to_writer(&mut *body, &ImageLoadMessage { stream })
+        .map_err(|error| Error::internal(format!("failed to encode image load status: {error}")))?;
+    body.push(b'\n');
+    Ok(())
 }
 
 fn read_json_body(request: &mut Request) -> std::result::Result<Vec<u8>, ApiError> {

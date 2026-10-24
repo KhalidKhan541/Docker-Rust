@@ -7,7 +7,7 @@
 //! exercising the actual `tiny_http` transport instead of a mock router.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
@@ -19,8 +19,8 @@ use docker_common::{Digest, ImageRef};
 use docker_daemon::{Daemon, SyntheticBehavior, SyntheticRuntime};
 use docker_events::EventBroker;
 use docker_image::{
-    Descriptor, EmptyObject, Image, ImageConfig, Platform, RootFS, MEDIA_TYPE_IMAGE_CONFIG,
-    MEDIA_TYPE_IMAGE_LAYER_GZIP, MEDIA_TYPE_IMAGE_MANIFEST,
+    Descriptor, EmptyObject, Image, ImageConfig, Manifest, Platform, RootFS,
+    MEDIA_TYPE_IMAGE_CONFIG, MEDIA_TYPE_IMAGE_LAYER_GZIP, MEDIA_TYPE_IMAGE_MANIFEST,
 };
 use docker_image_store::{canonical_repo_digest, canonical_tag, ImageRecord, ImageStore};
 use serde_json::{json, Value};
@@ -747,7 +747,7 @@ fn sample_image() -> ImageRecord {
     }
 }
 
-fn spawn_api_with_images() -> (RunningServer, tempfile::TempDir) {
+fn spawn_api_with_store(seed: impl FnOnce(&ImageStore)) -> (RunningServer, tempfile::TempDir) {
     let runtime = Arc::new(SyntheticRuntime::with_behavior(
         SyntheticBehavior::running_until_killed(),
     ));
@@ -755,10 +755,105 @@ fn spawn_api_with_images() -> (RunningServer, tempfile::TempDir) {
     let daemon = Arc::new(Daemon::spawn(runtime, broker.clone()).unwrap());
     let directory = tempfile::tempdir().unwrap();
     let store = ImageStore::open(directory.path().join("images")).unwrap();
-    store.insert(sample_image()).unwrap();
+    seed(&store);
     let api = Arc::new(ApiServer::new(daemon, broker).with_image_store(Arc::new(store)));
     let server = api.serve("127.0.0.1:0").unwrap();
     (server, directory)
+}
+
+fn spawn_api_with_images() -> (RunningServer, tempfile::TempDir) {
+    spawn_api_with_store(|store| {
+        store.insert(sample_image()).unwrap();
+    })
+}
+
+/// A digest-consistent image whose config, manifest and layer are present in
+/// the content store, unlike `sample_image()`. The layer is a real gzip tar so
+/// save/load can verify its diffID.
+fn insert_saveable_image(store: &ImageStore) -> ImageRecord {
+    let mut tar = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_size(6);
+    header.set_mode(0o644);
+    header.set_cksum();
+    tar.append_data(&mut header, "hello.txt", &b"hello\n"[..])
+        .unwrap();
+    let tar_bytes = tar.into_inner().unwrap();
+    let diff_id = Digest::sha256(&tar_bytes);
+
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&tar_bytes).unwrap();
+    let layer = encoder.finish().unwrap();
+    let layer_digest = Digest::sha256(&layer);
+
+    let config = Image {
+        architecture: "amd64".into(),
+        os: "linux".into(),
+        config: ImageConfig {
+            cmd: vec!["/hello".into()],
+            env: vec!["PATH=/bin".into()],
+            labels: [("saveable".to_string(), "yes".to_string())]
+                .into_iter()
+                .collect(),
+            ..ImageConfig::default()
+        },
+        rootfs: RootFS::layers(vec![diff_id]),
+        ..Image::default()
+    };
+    let config_bytes = serde_json::to_vec(&config).unwrap();
+    let config_digest = Digest::sha256(&config_bytes);
+    store
+        .blob_store()
+        .put_verified(&config_digest, &config_bytes)
+        .unwrap();
+
+    let manifest = Manifest::new(
+        Descriptor {
+            media_type: MEDIA_TYPE_IMAGE_CONFIG.into(),
+            digest: config_digest.clone(),
+            size: config_bytes.len() as i64,
+            ..Descriptor::default()
+        },
+        vec![Descriptor {
+            media_type: MEDIA_TYPE_IMAGE_LAYER_GZIP.into(),
+            digest: layer_digest.clone(),
+            size: layer.len() as i64,
+            ..Descriptor::default()
+        }],
+    );
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    let manifest_digest = store.blob_store().put(&manifest_bytes).unwrap().0;
+    store
+        .blob_store()
+        .put_verified(&layer_digest, &layer)
+        .unwrap();
+
+    let reference = ImageRef::parse("saveable:1.0").unwrap();
+    let record = ImageRecord {
+        id: config_digest,
+        manifest_digest: manifest_digest.clone(),
+        manifest_digests: vec![manifest_digest],
+        tags: [canonical_tag(&reference).unwrap()].into_iter().collect(),
+        repo_digests: Default::default(),
+        created: 1_700_000_000,
+        pulled_at: 1_700_000_001,
+        size: (config_bytes.len() + layer.len()) as i64,
+        config_size: config_bytes.len() as i64,
+        platform: Platform {
+            os: "linux".into(),
+            architecture: "amd64".into(),
+            ..Platform::default()
+        },
+        config,
+        layers: vec![Descriptor {
+            media_type: MEDIA_TYPE_IMAGE_LAYER_GZIP.into(),
+            digest: layer_digest,
+            size: layer.len() as i64,
+            ..Descriptor::default()
+        }],
+    };
+    store.insert(record.clone()).unwrap();
+    record
 }
 
 #[test]
@@ -834,6 +929,160 @@ fn image_list_inspect_tag_history_and_delete() {
     assert!(missing.text().contains("No such image"));
 }
 
+fn archive_entries(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
+    let mut entries = BTreeMap::new();
+    let mut archive = tar::Archive::new(Cursor::new(bytes));
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let path = entry.path().unwrap().to_string_lossy().into_owned();
+        let mut body = Vec::new();
+        entry.read_to_end(&mut body).unwrap();
+        entries.insert(path, body);
+    }
+    entries
+}
+
+#[test]
+fn image_save_and_load_round_trip_through_the_engine_api() {
+    let mut expected = None;
+    let (source, _source_directory) = spawn_api_with_store(|store| {
+        expected = Some(insert_saveable_image(store));
+    });
+    let expected = expected.unwrap();
+    let source_addr = source.addr();
+
+    let saved = http(source_addr, "GET", "/images/saveable:1.0/get", None, None);
+    assert_eq!(saved.status, 200, "{}", saved.text());
+    assert_eq!(saved.header("content-type"), Some("application/x-tar"));
+    let entries = archive_entries(&saved.body);
+    for required in ["oci-layout", "index.json", "manifest.json"] {
+        assert!(entries.contains_key(required), "missing {required}");
+    }
+    let index: Value = serde_json::from_slice(&entries["index.json"]).unwrap();
+    assert_eq!(
+        index["manifests"][0]["annotations"]["io.containerd.image.name"],
+        "docker.io/library/saveable:1.0"
+    );
+    assert_eq!(
+        index["manifests"][0]["annotations"]["org.opencontainers.image.ref.name"],
+        "1.0"
+    );
+    assert_eq!(
+        index["manifests"][0]["digest"],
+        expected.manifest_digest.full()
+    );
+    let manifest: Value = serde_json::from_slice(&entries["manifest.json"]).unwrap();
+    assert_eq!(manifest[0]["RepoTags"], json!(["saveable:1.0"]));
+    assert_eq!(
+        manifest[0]["Config"],
+        format!("blobs/sha256/{}", expected.id.hex())
+    );
+    assert!(entries.contains_key(&format!("blobs/sha256/{}", expected.layers[0].digest.hex())));
+
+    let saved_by_query = http(
+        source_addr,
+        "GET",
+        "/images/get?names=saveable:1.0",
+        None,
+        None,
+    );
+    assert_eq!(saved_by_query.status, 200, "{}", saved_by_query.text());
+    assert_eq!(saved_by_query.body, saved.body);
+
+    let platform = encoded(r#"{"architecture":"amd64","os":"linux"}"#);
+    let filtered = http(
+        source_addr,
+        "GET",
+        &format!("/images/saveable:1.0/get?platform={platform}"),
+        None,
+        None,
+    );
+    assert_eq!(filtered.status, 200, "{}", filtered.text());
+    let wrong_platform = encoded(r#"{"architecture":"arm64","os":"linux"}"#);
+    let filtered = http(
+        source_addr,
+        "GET",
+        &format!("/images/saveable:1.0/get?platform={wrong_platform}"),
+        None,
+        None,
+    );
+    assert_eq!(filtered.status, 400, "{}", filtered.text());
+    let repeated = http(
+        source_addr,
+        "GET",
+        &format!("/images/saveable:1.0/get?platform={platform}&platform={platform}"),
+        None,
+        None,
+    );
+    assert_eq!(repeated.status, 400, "{}", repeated.text());
+    assert!(repeated.text().contains("multiple platform"));
+    let missing = http(source_addr, "GET", "/images/does-not-exist/get", None, None);
+    assert_eq!(missing.status, 404, "{}", missing.text());
+    let no_names = http(source_addr, "GET", "/images/get", None, None);
+    assert_eq!(no_names.status, 400, "{}", no_names.text());
+
+    let (target, _target_directory) = spawn_api_with_store(|_| {});
+    let target_addr = target.addr();
+    let loaded = http(
+        target_addr,
+        "POST",
+        "/images/load",
+        Some(&saved.body),
+        Some("application/x-tar"),
+    );
+    assert_eq!(loaded.status, 200, "{}", loaded.text());
+    let messages: Vec<Value> = loaded
+        .text()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(messages.iter().any(|message| message["stream"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Loaded image: saveable:1.0")));
+
+    let list = http(target_addr, "GET", "/images/json", None, None).json();
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["Id"], expected.id.full());
+    assert_eq!(list[0]["RepoTags"], json!(["saveable:1.0"]));
+    assert_eq!(list[0]["Size"], expected.size);
+    assert_eq!(list[0]["Labels"]["saveable"], "yes");
+    let inspect = http(target_addr, "GET", "/images/saveable:1.0/json", None, None);
+    assert_eq!(inspect.status, 200, "{}", inspect.text());
+    assert_eq!(
+        inspect.json()["RootFS"]["Layers"],
+        json!([expected.config.rootfs.diff_ids[0].full()])
+    );
+
+    let re_saved = http(target_addr, "GET", "/images/saveable:1.0/get", None, None);
+    assert_eq!(re_saved.status, 200, "{}", re_saved.text());
+    assert_eq!(re_saved.body, saved.body);
+
+    let empty = http(
+        target_addr,
+        "POST",
+        "/images/load",
+        None,
+        Some("application/x-tar"),
+    );
+    assert_eq!(empty.status, 400, "{}", empty.text());
+    assert!(empty.text().contains("request body is empty"));
+
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(&saved.body).unwrap();
+    let gzip = gzip.finish().unwrap();
+    let (gzip_target, _gzip_directory) = spawn_api_with_store(|_| {});
+    let loaded = http(
+        gzip_target.addr(),
+        "POST",
+        "/images/load",
+        Some(&gzip),
+        Some("application/gzip"),
+    );
+    assert_eq!(loaded.status, 200, "{}", loaded.text());
+    assert!(loaded.text().contains("Loaded image: saveable:1.0"));
+}
+
 #[test]
 fn container_create_requires_a_local_image_and_inherits_image_defaults() {
     let (server, _directory) = spawn_api_with_images();
@@ -905,8 +1154,6 @@ fn image_endpoints_are_honest_without_a_store_and_for_unimplemented_features() {
     assert!(source.text().contains("from a source"), "{}", source.text());
     let prune = http(addr, "POST", "/images/prune", None, None);
     assert_eq!(prune.status, 501);
-    let save = http(addr, "GET", "/images/alpine:3.20/get", None, None);
-    assert_eq!(save.status, 501);
     let filters = encoded(r#"{"reference":["alpine"]}"#);
     let unsupported = http(
         addr,
