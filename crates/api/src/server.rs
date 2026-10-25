@@ -762,9 +762,12 @@ impl ApiServer {
             Some(store) => Some(store.resolve(dto.image.trim()).map_err(ApiError::from)?),
             None => None,
         };
-        let create = dto
+        let mut create = dto
             .into_daemon_with_image(Some(name), image.as_ref().map(|record| &record.config))
             .map_err(ApiError::from)?;
+        if let Some(image) = &image {
+            create = create.with_image_id(image.id.clone());
+        }
         let view = self.daemon.create(create).map_err(ApiError::from)?;
         Ok(Reply::json(
             201,

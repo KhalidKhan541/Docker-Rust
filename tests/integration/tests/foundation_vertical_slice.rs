@@ -91,6 +91,7 @@ fn foundation_vertical_slice() {
         name: Some(name.as_str().into()),
         created_at: 1_700_000_000,
         config: config.clone(),
+        image_id: None,
         state: StateSnapshot {
             status: LifecycleState::Running,
             exit_code: None,
@@ -201,6 +202,7 @@ fn foundation_error_paths() {
             stop_timeout_secs: 10,
             exposed_ports: vec![],
         },
+        image_id: None,
         state: StateSnapshot {
             status: LifecycleState::Created,
             exit_code: None,

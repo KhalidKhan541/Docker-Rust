@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use docker_common::ContainerId;
+use docker_common::{ContainerId, Digest};
 use docker_errors::{Error, Result};
 
 use crate::config::{ContainerConfig, HostConfig};
@@ -22,6 +22,9 @@ pub struct ContainerRecord {
     /// Unix seconds when the record was created.
     pub created_at: i64,
     pub config: ContainerConfig,
+    /// Image ID resolved at create time. It pins the container to the image
+    /// that supplied its defaults even if the original tag moves later.
+    pub image_id: Option<Digest>,
     /// Host-side options are part of the record because restart policy and
     /// auto-remove are consulted on every exit, not only at start.
     pub host_config: HostConfig,
@@ -174,6 +177,7 @@ mod tests {
                 stop_timeout_secs: 10,
                 exposed_ports: vec![],
             },
+            image_id: None,
             state: StateSnapshot {
                 status: LifecycleState::Created,
                 exit_code: None,

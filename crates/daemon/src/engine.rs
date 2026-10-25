@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use docker_common::{ContainerId, Name};
+use docker_common::{ContainerId, Digest, Name};
 use docker_container_model::config::{ContainerConfig, HostConfig, Signal};
 use docker_container_model::state::{validate_transition, LifecycleState, StateSnapshot};
 use docker_container_model::store::{ContainerFilter, ContainerRecord, ContainerStore};
@@ -49,6 +49,9 @@ fn unix_now() -> i64 {
 pub struct CreateRequest {
     pub name: Option<String>,
     pub config: ContainerConfig,
+    /// Image ID resolved by the API layer. `None` is used by direct daemon
+    /// tests and by synthetic-runtime callers that do not resolve images.
+    pub image_id: Option<Digest>,
     pub host_config: HostConfig,
 }
 
@@ -57,8 +60,14 @@ impl CreateRequest {
         Self {
             name: None,
             config,
+            image_id: None,
             host_config: HostConfig::default(),
         }
+    }
+
+    pub fn with_image_id(mut self, image_id: Digest) -> Self {
+        self.image_id = Some(image_id);
+        self
     }
 
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
@@ -80,6 +89,7 @@ pub struct ContainerView {
     pub name: Option<String>,
     pub created_at: i64,
     pub config: ContainerConfig,
+    pub image_id: Option<Digest>,
     pub host_config: HostConfig,
     pub state: StateSnapshot,
     pub restart_count: u32,
@@ -92,6 +102,7 @@ impl ContainerView {
             name: record.name.clone(),
             created_at: record.created_at,
             config: record.config.clone(),
+            image_id: record.image_id.clone(),
             host_config: record.host_config.clone(),
             state: record.state.clone(),
             restart_count,
@@ -461,6 +472,7 @@ impl Engine {
             name,
             created_at: unix_now(),
             config: request.config,
+            image_id: request.image_id,
             host_config: request.host_config,
             state: StateSnapshot::created(),
         };
@@ -730,11 +742,14 @@ impl Engine {
             }
         }
 
-        let runtime_config = RuntimeConfig::new(
+        let mut runtime_config = RuntimeConfig::new(
             id.clone(),
             record.config.clone(),
             record.host_config.clone(),
         );
+        if let Some(image_id) = record.image_id.clone() {
+            runtime_config = runtime_config.with_image_id(image_id);
+        }
         let task_box = self.runtime.create(&runtime_config)?;
         if let Err(error) = task_box.start() {
             let _ = task_box.delete();
@@ -1200,6 +1215,7 @@ impl Engine {
 
     fn remove_record(&mut self, id: &ContainerId) -> Result<()> {
         let record = self.store.get(id)?.clone();
+        self.runtime.cleanup(id)?;
         self.store.remove(id)?;
         self.meta.remove(id);
         self.tasks.remove(id);

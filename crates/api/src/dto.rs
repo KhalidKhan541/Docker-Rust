@@ -1118,7 +1118,11 @@ impl From<&ContainerView> for ContainerSummary {
                 .map(|name| vec![format!("/{}", name.trim_start_matches('/'))])
                 .unwrap_or_default(),
             image: view.config.image.to_string(),
-            image_id: String::new(),
+            image_id: view
+                .image_id
+                .as_ref()
+                .map(docker_common::Digest::full)
+                .unwrap_or_default(),
             command: view.config.effective_argv().join(" "),
             created: view.created_at,
             ports: Vec::new(),
@@ -1151,7 +1155,11 @@ impl From<&ContainerView> for InspectResponse {
             path,
             args,
             state: inspect_state(&view.state),
-            image: config.image.to_string(),
+            image: view
+                .image_id
+                .as_ref()
+                .map(docker_common::Digest::full)
+                .unwrap_or_else(|| config.image.to_string()),
             resolv_conf_path: String::new(),
             hostname_path: String::new(),
             hosts_path: String::new(),

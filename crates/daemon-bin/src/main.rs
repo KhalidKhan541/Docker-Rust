@@ -27,6 +27,10 @@ use docker_errors::{Error, Result};
 use docker_events::EventBroker;
 use docker_image_store::ImageStore;
 use docker_logging::{init_daemon_tracing, DaemonLevel};
+use docker_runtime::{OciRuntime, RootfsProvider, Runtime};
+
+mod rootfs_provider;
+use rootfs_provider::ImageRootfsProvider;
 
 const HELP: &str = "\
 docker-rsd — Docker-compatible Engine API daemon
@@ -39,8 +43,9 @@ Options:
   --data-root <DIR>      Image/container data root (must be writable)
   --config <FILE>        daemon.json-style configuration file
   --log-level <LEVEL>    debug | info | warn | error
-  --runtime <NAME>       Run container lifecycle with the named runtime
-                         (currently: synthetic)
+  --runtime <NAME>       Execution backend: synthetic (default) or oci
+                         (oci requires Linux, root, and a built
+                         docker-runtime-init next to docker-rsd)
   -h, --help             Print this help
   -V, --version          Print the version
 
@@ -106,24 +111,46 @@ fn run() -> Result<()> {
         ))
     })?);
 
-    let runtime_name = options.runtime.unwrap_or_else(|| "synthetic".to_string());
-    if runtime_name != "synthetic" {
-        return Err(Error::unsupported(format!(
-            "runtime {runtime_name:?} is not runnable: the native OCI backend needs a prepared rootfs provider, \
-             and no image-rootfs materializer is wired into the daemon yet; use `--runtime synthetic` for the API layer"
-        )));
-    }
+    let requested_runtime = options.runtime.unwrap_or_else(|| "synthetic".to_string());
+    let (runtime, runtime_name, runtime_path, synthetic): (Arc<dyn Runtime>, String, String, bool) =
+        match requested_runtime.as_str() {
+            "synthetic" => (
+                Arc::new(SyntheticRuntime::with_behavior(
+                    SyntheticBehavior::running_until_killed(),
+                )),
+                "synthetic".to_string(),
+                "synthetic://in-process".to_string(),
+                true,
+            ),
+            "oci" | "native" => {
+                let rootfs: Arc<dyn RootfsProvider> = Arc::new(ImageRootfsProvider::new(
+                    Arc::clone(&images),
+                    &config.data_root,
+                ));
+                let runtime =
+                    OciRuntime::new(config.data_root.join("runtime")).with_rootfs_provider(rootfs);
+                runtime.preflight()?;
+                (
+                    Arc::new(runtime),
+                    "oci".to_string(),
+                    "native://linux-namespaces+chroot".to_string(),
+                    false,
+                )
+            }
+            other => {
+                return Err(Error::invalid_argument(format!(
+                    "unknown runtime {other:?}; supported runtimes are `synthetic` and `oci`"
+                )))
+            }
+        };
 
     let listen = parse_listen_address(&config.api_host)?;
     let broker = Arc::new(EventBroker::new());
-    let runtime = Arc::new(SyntheticRuntime::with_behavior(
-        SyntheticBehavior::running_until_killed(),
-    ));
     let daemon = Arc::new(Daemon::spawn(runtime, Arc::clone(&broker))?);
     let server_config = ServerConfig {
-        runtime_name: "synthetic".to_string(),
-        runtime_path: "synthetic://in-process".to_string(),
-        synthetic: true,
+        runtime_name: runtime_name.clone(),
+        runtime_path,
+        synthetic,
         ..ServerConfig::default()
     };
     let api = Arc::new(
@@ -135,9 +162,15 @@ fn run() -> Result<()> {
     println!("docker-rsd listening on http://{}", server.addr());
     println!("client: DOCKER_HOST=tcp://{} docker version", server.addr());
     println!("image store: {}", images.root().display());
-    println!(
-        "warning: synthetic runtime is active; container lifecycle is real, but no host process is executed"
-    );
+    if synthetic {
+        println!(
+            "warning: synthetic runtime is active; container lifecycle is real, but no host process is executed"
+        );
+    } else {
+        println!(
+            "warning: native OCI runtime is experimental; bridge networking, cgroups, logs, and rootless mode are not implemented"
+        );
+    }
 
     // Keep the process (and the `RunningServer` handle) alive until the OS
     // terminates it. A future milestone adds a control socket for graceful

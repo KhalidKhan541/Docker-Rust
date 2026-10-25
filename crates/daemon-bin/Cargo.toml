@@ -14,11 +14,14 @@ unsafe_code = "forbid"
 
 [dependencies]
 docker-api = { workspace = true }
+docker-common = { workspace = true }
 docker-configuration = { workspace = true }
+docker-container-model = { workspace = true }
 docker-daemon = { workspace = true }
 docker-errors = { workspace = true }
 docker-events = { workspace = true }
 docker-image-store = { workspace = true }
 docker-logging = { workspace = true }
+docker-runtime = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
