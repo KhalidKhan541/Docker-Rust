@@ -56,7 +56,17 @@ jobs:
         run: |
           TEST_BIN=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "native_runtime" and .executable != null) | .executable' native-test-artifacts.json | tail -n 1)
           test -n "$TEST_BIN"
-          sudo --preserve-env=PATH,RUST_BACKTRACE "$TEST_BIN" --ignored --nocapture
+          set -o pipefail
+          sudo --preserve-env=PATH,RUST_BACKTRACE "$TEST_BIN" --ignored --nocapture 2>&1 | tee smoke.log
+          status=$?
+          {
+            echo "### Native runtime smoke test"
+            echo
+            echo '```'
+            cat smoke.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
         env:
           RUST_BACKTRACE: 1
 
