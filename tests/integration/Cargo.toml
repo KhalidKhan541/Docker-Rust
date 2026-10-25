@@ -14,10 +14,16 @@ docker-events = { workspace = true }
 docker-container-model = { workspace = true }
 docker-daemon = { workspace = true }
 docker-image = { workspace = true }
+docker-image-store = { workspace = true }
 docker-storage = { workspace = true }
 docker-distribution = { workspace = true }
+docker-runtime = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }
+tar = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.30", default-features = false, features = ["user"] }
 
 [dev-dependencies]
 tempfile = "3"

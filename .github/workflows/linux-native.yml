@@ -1,0 +1,51 @@
+name: linux-native
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Linux workspace + native runtime
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build workspace
+        run: cargo build --workspace
+
+      - name: Tests
+        run: cargo test --workspace
+
+      - name: Build native runtime smoke test
+        run: cargo test -p docker-rs-integration --test native_runtime --no-run --message-format=json > native-test-artifacts.json
+
+      - name: Native runtime smoke test (root)
+        run: |
+          TEST_BIN=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "native_runtime" and .executable != null) | .executable' native-test-artifacts.json | tail -n 1)
+          test -n "$TEST_BIN"
+          sudo --preserve-env=PATH "$TEST_BIN" --ignored --nocapture
+
+      - name: Engine API native smoke test (root)
+        run: sudo --preserve-env=PATH bash tests/linux-native-smoke.sh

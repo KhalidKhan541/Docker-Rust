@@ -290,13 +290,16 @@ dependencies = [
  "docker-errors",
  "docker-image",
  "docker-storage",
+ "filetime",
  "flate2",
+ "nix",
  "serde",
  "serde_json",
  "sha2",
  "tar",
  "tempfile",
  "tracing",
+ "xattr",
 ]
 
 [[package]]
@@ -324,9 +327,13 @@ dependencies = [
  "docker-errors",
  "docker-events",
  "docker-image",
+ "docker-image-store",
  "docker-logging",
+ "docker-runtime",
  "docker-storage",
+ "nix",
  "serde_json",
+ "tar",
  "tempfile",
 ]
 
@@ -335,12 +342,15 @@ name = "docker-rsd"
 version = "0.1.0"
 dependencies = [
  "docker-api",
+ "docker-common",
  "docker-configuration",
+ "docker-container-model",
  "docker-daemon",
  "docker-errors",
  "docker-events",
  "docker-image-store",
  "docker-logging",
+ "docker-runtime",
  "serde_json",
  "tracing",
 ]
