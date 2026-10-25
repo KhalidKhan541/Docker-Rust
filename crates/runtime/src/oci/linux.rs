@@ -25,11 +25,28 @@ pub(crate) fn create_task(
     runtime: &OciRuntime,
     config: &RuntimeConfig,
 ) -> Result<Box<dyn RuntimeTask>> {
-    let rootfs = config.rootfs.as_ref().ok_or_else(|| {
-        Error::invalid_argument(
-            "native OCI runtime requires a prepared rootfs (RuntimeConfig::with_rootfs)",
-        )
-    })?;
+    if !nix::unistd::Uid::effective().is_root() {
+        return Err(Error::permission_denied(
+            "the native OCI runtime requires root; run docker-rsd as root or select --runtime synthetic",
+        ));
+    }
+
+    let prepared = match &config.rootfs {
+        Some(_) => None,
+        None => {
+            let provider = runtime.rootfs_provider.as_ref().ok_or_else(|| {
+                Error::invalid_argument(
+                    "native OCI runtime requires a prepared rootfs or a configured image-rootfs provider",
+                )
+            })?;
+            Some(provider.prepare(&config.id, &config.config, config.image_id.as_ref())?)
+        }
+    };
+    let rootfs = config
+        .rootfs
+        .as_deref()
+        .or(prepared.as_deref())
+        .expect("rootfs is present when prepared is None");
 
     let spec = spec_from_container(&config.id, &config.config, &config.host_config, rootfs)?;
     ensure_supported(&spec)?;

@@ -5,12 +5,14 @@
 //! honor. A feature is never silently dropped: anything not implemented
 //! returns `Unsupported` with the missing capability named.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use docker_errors::{Error, Result};
 
 use crate::spec::{LinuxNamespaceType, Process, Spec};
-use crate::task::{Runtime, RuntimeConfig, RuntimeTask};
+use crate::task::{RootfsProvider, Runtime, RuntimeConfig, RuntimeTask};
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -28,12 +30,25 @@ pub const RUNTIME_INIT_ENV: &str = "DOCKER_RS_RUNTIME_INIT";
 
 /// Native OCI runtime. Bundle generation is portable; process execution is
 /// currently implemented only on Linux.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OciRuntime {
     pub(crate) state_root: PathBuf,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) init_program: Option<PathBuf>,
     pub(crate) capture_stdio: bool,
+    pub(crate) rootfs_provider: Option<Arc<dyn RootfsProvider>>,
+}
+
+impl fmt::Debug for OciRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OciRuntime")
+            .field("state_root", &self.state_root)
+            .field("init_program", &self.init_program)
+            .field("capture_stdio", &self.capture_stdio)
+            .field("has_rootfs_provider", &self.rootfs_provider.is_some())
+            .finish()
+    }
 }
 
 impl OciRuntime {
@@ -43,7 +58,15 @@ impl OciRuntime {
             state_root: state_root.into(),
             init_program: None,
             capture_stdio: false,
+            rootfs_provider: None,
         }
+    }
+
+    /// Supply the provider used to materialize root filesystems when a task
+    /// is created without `RuntimeConfig::with_rootfs`.
+    pub fn with_rootfs_provider(mut self, provider: Arc<dyn RootfsProvider>) -> Self {
+        self.rootfs_provider = Some(provider);
+        self
     }
 
     /// Override the init helper path instead of resolving it next to the
@@ -113,11 +136,50 @@ impl OciRuntime {
             current.display()
         )))
     }
+
+    /// Verify the host can execute native tasks before the daemon starts
+    /// serving requests. This reports unsupported hosts and missing
+    /// privileges up front instead of failing on the first `start`.
+    pub fn preflight(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            self.resolve_init_program()?;
+            if !nix::unistd::Uid::effective().is_root() {
+                return Err(Error::permission_denied(
+                    "the native OCI runtime requires root (or a privileged user namespace, which is not implemented yet); \
+                     run docker-rsd as root or select --runtime synthetic",
+                ));
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(Error::unsupported(format!(
+                "native OCI execution requires Linux namespaces and mount/chroot privileges; this host is {}",
+                std::env::consts::OS
+            )))
+        }
+    }
 }
 
 impl Runtime for OciRuntime {
     fn create(&self, config: &RuntimeConfig) -> Result<Box<dyn RuntimeTask>> {
         create_task(self, config)
+    }
+
+    fn cleanup(&self, id: &docker_common::ContainerId) -> Result<()> {
+        if let Some(provider) = &self.rootfs_provider {
+            provider.cleanup(id)?;
+        }
+        let bundle = self.state_root.join(id.as_str());
+        match std::fs::remove_dir_all(&bundle) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Error::internal(format!(
+                "removing OCI bundle `{}`: {error}",
+                bundle.display()
+            ))),
+        }
     }
 }
 

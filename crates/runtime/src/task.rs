@@ -22,7 +22,7 @@
 use std::path::PathBuf;
 use std::process::{ChildStderr, ChildStdin, ChildStdout};
 
-use docker_common::ContainerId;
+use docker_common::{ContainerId, Digest};
 use docker_container_model::config::{ContainerConfig, HostConfig, Signal};
 use docker_errors::Result;
 
@@ -32,8 +32,12 @@ pub struct RuntimeConfig {
     pub id: ContainerId,
     pub config: ContainerConfig,
     pub host_config: HostConfig,
-    /// Prepared root filesystem for the container. The image/store layer
-    /// supplies this in later milestones; synthetic runtimes ignore it.
+    /// Image ID resolved when the container was created. It pins the layer
+    /// set across tag moves and daemon restarts; the daemon supplies it when
+    /// the create request resolved an image.
+    pub image_id: Option<Digest>,
+    /// Already prepared root filesystem. When absent, the configured
+    /// [`RootfsProvider`] materializes it from `image_id`/`config.image`.
     pub rootfs: Option<PathBuf>,
 }
 
@@ -43,6 +47,7 @@ impl RuntimeConfig {
             id,
             config,
             host_config,
+            image_id: None,
             rootfs: None,
         }
     }
@@ -50,6 +55,32 @@ impl RuntimeConfig {
     pub fn with_rootfs(mut self, rootfs: impl Into<PathBuf>) -> Self {
         self.rootfs = Some(rootfs.into());
         self
+    }
+
+    pub fn with_image_id(mut self, image_id: Digest) -> Self {
+        self.image_id = Some(image_id);
+        self
+    }
+}
+
+/// Prepares and removes per-container root filesystems.
+///
+/// The runtime owns execution, not image storage. A provider is therefore
+/// supplied by the daemon binary and called lazily on first start. It must be
+/// safe to call `prepare` again after a crash: a complete rootfs may be
+/// reused, while a partial one must be replaced atomically.
+pub trait RootfsProvider: Send + Sync + 'static {
+    fn prepare(
+        &self,
+        id: &ContainerId,
+        config: &ContainerConfig,
+        image_id: Option<&Digest>,
+    ) -> Result<PathBuf>;
+
+    /// Remove the persisted rootfs for a container that is being deleted.
+    fn cleanup(&self, id: &ContainerId) -> Result<()> {
+        let _ = id;
+        Ok(())
     }
 }
 
@@ -105,6 +136,13 @@ impl ExitStatus {
 /// and from monitor threads.
 pub trait Runtime: Send + Sync + 'static {
     fn create(&self, config: &RuntimeConfig) -> Result<Box<dyn RuntimeTask>>;
+
+    /// Release runtime-owned resources for a container that was removed.
+    /// Synthetic runtimes keep no such resources and use the default.
+    fn cleanup(&self, id: &ContainerId) -> Result<()> {
+        let _ = id;
+        Ok(())
+    }
 }
 
 /// One task (container init process) managed by the daemon.

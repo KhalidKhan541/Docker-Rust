@@ -21,4 +21,4 @@ pub mod task;
 pub use bundle::{spec_from_container, Bundle, DEFAULT_PATH_ENV};
 pub use oci::{ensure_supported, OciRuntime, RUNTIME_INIT_ENV};
 pub use spec::{ContainerState, Spec, State, OCI_VERSION};
-pub use task::{ExitStatus, Runtime, RuntimeConfig, RuntimeTask, StdioHandles};
+pub use task::{ExitStatus, RootfsProvider, Runtime, RuntimeConfig, RuntimeTask, StdioHandles};
