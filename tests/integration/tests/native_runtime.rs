@@ -115,17 +115,25 @@ fn starts_a_real_process_in_a_materialized_rootfs() {
     task.start().unwrap();
     let mut stdio = task.take_stdio().unwrap().expect("captured stdio");
     let status = task.wait().unwrap();
-    let mut output = String::new();
-    stdio
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut output)
-        .unwrap();
+    // Drain both pipes before asserting so the init helper's own panic
+    // output reaches the test log when the container fails to start.
+    let mut stdout = Vec::new();
+    if let Some(pipe) = stdio.stdout.as_mut() {
+        pipe.read_to_end(&mut stdout).unwrap();
+    }
+    let mut stderr = Vec::new();
+    if let Some(pipe) = stdio.stderr.as_mut() {
+        pipe.read_to_end(&mut stderr).unwrap();
+    }
     task.delete().unwrap();
+    let stdout = String::from_utf8_lossy(&stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr).into_owned();
 
-    assert!(status.success(), "probe exited with {status:?}");
-    assert!(output.contains(PROBE_OUTPUT), "probe output was {output:?}");
+    assert!(
+        status.success(),
+        "probe exited with {status:?}\nstdout: {stdout:?}\nstderr: {stderr:?}"
+    );
+    assert!(stdout.contains(PROBE_OUTPUT), "probe output was {stdout:?}");
 }
 
 fn init_program() -> PathBuf {
