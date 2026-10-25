@@ -72,6 +72,8 @@ tiny_http = "0.12"
 tar = "0.4"
 flate2 = "1"
 tempfile = "3"
+filetime = "0.2"
+xattr = "1"
 
 [profile.dev]
 # Binaries must stay small on this 4 GB host; debug info is not needed for

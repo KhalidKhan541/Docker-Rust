@@ -10,6 +10,7 @@
 pub mod archive;
 pub mod pull;
 pub mod reference;
+pub mod rootfs;
 pub mod store;
 
 pub use archive::{LoadOutcome, LoadedImage};
@@ -18,4 +19,5 @@ pub use reference::{
     canonical_registry_repo, canonical_repo_digest, canonical_tag, canonical_tag_from_parts,
     familiar_reference, host_platform, parse_platform,
 };
+pub use rootfs::{materialize_rootfs, populate_standard_devices};
 pub use store::{DeleteOutcome, ImageRecord, ImageStore};
