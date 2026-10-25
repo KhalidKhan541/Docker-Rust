@@ -39,6 +39,10 @@ pub struct RuntimeConfig {
     /// Already prepared root filesystem. When absent, the configured
     /// [`RootfsProvider`] materializes it from `image_id`/`config.image`.
     pub rootfs: Option<PathBuf>,
+    /// Capture a container's stdio into runtime-owned pipes so the daemon can
+    /// claim them with `RuntimeTask::take_stdio` (log capture, attach). When
+    /// false, streams are inherited by the daemon process.
+    pub capture_stdio: bool,
 }
 
 impl RuntimeConfig {
@@ -49,6 +53,7 @@ impl RuntimeConfig {
             host_config,
             image_id: None,
             rootfs: None,
+            capture_stdio: false,
         }
     }
 
@@ -59,6 +64,12 @@ impl RuntimeConfig {
 
     pub fn with_image_id(mut self, image_id: Digest) -> Self {
         self.image_id = Some(image_id);
+        self
+    }
+
+    /// Request runtime-owned stdio pipes (see `RuntimeTask::take_stdio`).
+    pub fn with_capture_stdio(mut self, capture: bool) -> Self {
+        self.capture_stdio = capture;
         self
     }
 }

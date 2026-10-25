@@ -13,6 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::io::Read;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -26,6 +27,7 @@ use docker_errors::{Error, Result};
 use docker_events::{event_now, Actor, EventAction, EventBroker, EventType, KnownAction};
 use serde::Serialize;
 
+use crate::logs::{LogStore, Stream, DEFAULT_LOG_CAPACITY};
 use crate::restart::RestartManager;
 use crate::runtime::{ExitStatus, Runtime, RuntimeConfig, RuntimeTask};
 
@@ -210,6 +212,17 @@ impl Daemon {
         })
     }
 
+    /// Shared handle to a container's captured stdio log store, so API
+    /// streaming handlers can read (and follow) without owning actor state.
+    /// `None` would mean the record vanished mid-flight, which callers treat
+    /// as 404.
+    pub fn log_store(&self, reference: &str) -> Result<Option<Arc<LogStore>>> {
+        self.call(|reply| Command::Logs {
+            reference: reference.to_string(),
+            reply,
+        })
+    }
+
     /// Stop all tasks and join the actor. Idempotent.
     pub fn shutdown(&mut self) -> Result<()> {
         let Some(worker) = self.worker.take() else {
@@ -277,6 +290,10 @@ enum Command {
         filters: Vec<ContainerFilter>,
         reply: Sender<Result<Vec<ContainerView>>>,
     },
+    Logs {
+        reference: String,
+        reply: Sender<Result<Option<Arc<LogStore>>>>,
+    },
     TaskExited {
         id: ContainerId,
         generation: u64,
@@ -293,6 +310,9 @@ struct Meta {
     restart_count: u32,
     manually_stopped: bool,
     last_exit: Option<ExitStatus>,
+    /// Captured stdio ring buffer; lives for the whole container lifetime and
+    /// accumulates across restarts like Moby's json-file log driver.
+    logs: Arc<LogStore>,
 }
 
 impl Meta {
@@ -302,6 +322,7 @@ impl Meta {
             restart_count: 0,
             manually_stopped: false,
             last_exit: None,
+            logs: Arc::new(LogStore::new(DEFAULT_LOG_CAPACITY)),
         }
     }
 }
@@ -430,6 +451,10 @@ impl Engine {
             }
             Command::List { filters, reply } => {
                 let result = self.list(&filters);
+                let _ = reply.send(result);
+            }
+            Command::Logs { reference, reply } => {
+                let result = self.log_store(&reference);
                 let _ = reply.send(result);
             }
             Command::TaskExited {
@@ -728,6 +753,50 @@ impl Engine {
             .map(|record| record.id.clone())
     }
 
+    fn log_store(&mut self, reference: &str) -> Result<Option<Arc<LogStore>>> {
+        let id = self.resolve_id(reference)?;
+        Ok(self.meta.get(&id).map(|meta| Arc::clone(&meta.logs)))
+    }
+
+    /// Drain one captured pipe into the container's log store. Each read
+    /// chunk becomes one record; the Engine API re-frames records with
+    /// stdcopy headers, so granularity only affects coalescing. The lease
+    /// keeps the follow EOF signal off until the pipe reaches EOF.
+    fn spawn_pipe_capture(
+        id: &ContainerId,
+        logs: &Arc<LogStore>,
+        pipe: Box<dyn Read + Send>,
+        stream: Stream,
+    ) {
+        let lease = logs.take_writer();
+        let sid = &id.as_str()[..12.min(id.as_str().len())];
+        let name = format!(
+            "docker-log-{sid}-{}",
+            match stream {
+                Stream::Stdout => "stdout",
+                Stream::Stderr => "stderr",
+            }
+        );
+        let spawned = thread::Builder::new().name(name).spawn(move || {
+            let mut pipe = pipe;
+            let mut buffer = [0u8; 8192];
+            loop {
+                match pipe.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => lease.append(stream, &buffer[..count]),
+                }
+            }
+            // Lease drop releases the writer slot; the last one closes the
+            // store so followers reach EOF.
+        });
+        // If the thread could not start, `spawn` drops the rejected closure,
+        // which releases its lease: one failing pipe keeps the store open,
+        // two failing pipes close it, both handled by the drop path.
+        if let Err(_error) = spawned {
+            tracing::warn!(container = %sid, "cannot start log capture thread");
+        }
+    }
+
     fn start_task(&mut self, id: &ContainerId, manual: bool) -> Result<()> {
         let record = self.store.get(id)?.clone();
         if manual {
@@ -750,12 +819,49 @@ impl Engine {
         if let Some(image_id) = record.image_id.clone() {
             runtime_config = runtime_config.with_image_id(image_id);
         }
+        // Capture stdio whenever the runtime supports it (log capture, later
+        // attach); runtimes without pipes ignore this flag.
+        runtime_config = runtime_config.with_capture_stdio(true);
         let task_box = self.runtime.create(&runtime_config)?;
         if let Err(error) = task_box.start() {
             let _ = task_box.delete();
             return Err(error);
         }
         let task: Arc<dyn RuntimeTask> = Arc::from(task_box);
+
+        // Claim the runtime's pipes and drain them into the container's log
+        // store before spawning the monitor, so `docker logs -f` sees every
+        // buffered byte and can follow until the pipes close. Failure to
+        // claim stdio is logged but never fatal: a running container is more
+        // valuable than its captured log.
+        if let Some(logs) = self.meta.get(id).map(|meta| Arc::clone(&meta.logs)) {
+            logs.reopen();
+            match task.take_stdio() {
+                Ok(Some(stdio)) => {
+                    // No attach layer yet: closing the writer end gives the
+                    // child EOF on stdin, matching detached (`-d`) semantics.
+                    drop(stdio.stdin);
+                    let mut pipes: Vec<(Box<dyn Read + Send>, Stream)> = Vec::new();
+                    if let Some(stdout) = stdio.stdout {
+                        pipes.push((Box::new(stdout), Stream::Stdout));
+                    }
+                    if let Some(stderr) = stdio.stderr {
+                        pipes.push((Box::new(stderr), Stream::Stderr));
+                    }
+                    for (pipe, stream) in pipes {
+                        Self::spawn_pipe_capture(id, &logs, pipe, stream);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        container = %id.as_str(),
+                        error = %error,
+                        "cannot capture container stdio; logs will be empty"
+                    );
+                }
+            }
+        }
 
         let generation = self.next_generation;
         self.next_generation += 1;
@@ -917,6 +1023,14 @@ impl Engine {
             return;
         };
         let duration = active.started_at.elapsed();
+
+        // With no captured stdio (synthetic runtime, or capture failed) no
+        // writer will ever flip the close signal; do it here so `docker logs
+        // -f` follows until the exit. Containers with capture threads close
+        // when those threads drain their pipes instead.
+        if let Some(meta) = self.meta.get(id) {
+            meta.logs.close_if_idle();
+        }
 
         let exit = match result {
             Ok(exit) => exit,
@@ -1216,6 +1330,11 @@ impl Engine {
     fn remove_record(&mut self, id: &ContainerId) -> Result<()> {
         let record = self.store.get(id)?.clone();
         self.runtime.cleanup(id)?;
+        // Force-close the log store so any follower stream ends even if a
+        // capture thread is still draining a lingering pipe.
+        if let Some(meta) = self.meta.get(id) {
+            meta.logs.close();
+        }
         self.store.remove(id)?;
         self.meta.remove(id);
         self.tasks.remove(id);
@@ -1275,6 +1394,10 @@ impl Engine {
             }
         }
         self.tasks.clear();
+        // Nothing should keep followers waiting after the daemon is gone.
+        for meta in self.meta.values() {
+            meta.logs.close();
+        }
         for (_, pending) in self.pending_stops.drain() {
             let _ = pending
                 .reply

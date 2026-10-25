@@ -35,8 +35,10 @@ use crate::image_dto::{
     history_items, ImageDeleteItem, ImageInspectResponse, ImageLoadMessage, ImagePullMessage,
     ImageSummary,
 };
-use crate::query::{ContainerListOptions, EventFilters, EventOptions, Query};
+use crate::query::{ContainerListOptions, EventFilters, EventOptions, LogsOptions, Query};
 use crate::version::{self, VersionDecision, VersionGate, VersionUnsupported};
+
+use docker_daemon::{LogEntry, LogStore, Stream as LogStreamSource};
 
 /// Upper bound for an imported image archive. The body is spooled to a
 /// temporary file, so this is a disk bound rather than a memory bound.
@@ -267,6 +269,7 @@ impl ApiServer {
                 self.wait(id, &query)
             }
             ["containers", id] if method == "DELETE" => self.remove(id, &query),
+            ["containers", id, "logs"] if method == "GET" => self.container_logs(id, &query),
             ["containers", id, action] => self.unsupported_container_action(id, action),
             ["images", "json"] if method == "GET" => self.image_list(&query),
             ["images", "create"] if method == "POST" => self.image_pull(request, &query),
@@ -861,13 +864,83 @@ impl ApiServer {
         }
     }
 
+    /// `GET /containers/{id}/logs` — mirrors Moby's `getContainersLogs`:
+    /// parameters are validated before the stream starts (since HTTP 200 with
+    /// chunked framing cannot carry errors later), output is written through
+    /// stdcopy-style framing (TTY is unsupported at create time, so frames
+    /// are always used), and `follow` keeps the connection open until the
+    /// container's captured pipes reach EOF or the store is force-closed.
+    fn container_logs(&self, id: &str, query: &Query) -> std::result::Result<Reply, ApiError> {
+        let options = LogsOptions::parse(query).map_err(ApiError::from)?;
+        let store = self.daemon.log_store(id).map_err(ApiError::from)?;
+        let Some(store) = store else {
+            return Err(ApiError::not_found(format!("no such container: {id}")));
+        };
+        let stream = match (options.stdout, options.stderr) {
+            (true, true) | (false, false) => None, // stream-less request rejected while parsing
+            (true, false) => Some(LogStreamSource::Stdout),
+            (false, true) => Some(LogStreamSource::Stderr),
+        };
+
+        // Backlog: stored records matching stream/time filters, cut to the
+        // last `tail` lines like Moby's logreader (tail applies after
+        // filtering; `0` yields no backlog but follow still streams new
+        // records, and follow starts from the same slice it would print).
+        let (records, _) = store.entries_and_state(0, stream);
+        let backlog = tail_slice(
+            &records
+                .into_iter()
+                .filter(|entry| {
+                    options
+                        .since_nanos
+                        .is_none_or(|since| entry.timestamp_nanos >= since)
+                        && options
+                            .until_nanos
+                            .is_none_or(|until| entry.timestamp_nanos <= until)
+                })
+                .collect::<Vec<LogEntry>>(),
+            options.tail_lines,
+        );
+        let mut replay: VecDeque<Vec<u8>> = backlog
+            .iter()
+            .map(|entry| frame_entry(entry, options.timestamps))
+            .collect();
+        // Follow skips everything already framed: records after the last
+        // backlog record are picked up by the live loop (tail is a backlog
+        // concept only, exactly like Moby's logreader).
+        let cursor = backlog.last().map_or(0, |entry| entry.seq + 1);
+
+        if !options.follow {
+            let mut body = Vec::new();
+            for frame in replay.drain(..) {
+                body.extend_from_slice(&frame);
+            }
+            return Ok(Reply::buffered(200, VIEW_MULTIPLEXED_STREAM, body));
+        }
+        Ok(Reply::stream(
+            VIEW_MULTIPLEXED_STREAM,
+            Box::new(EntryStream {
+                store,
+                replay,
+                next: cursor,
+                stream,
+                timestamps: options.timestamps,
+                since_nanos: options.since_nanos,
+                until_nanos: options.until_nanos,
+                current: Vec::new(),
+                offset: 0,
+                closed: false,
+            }),
+        ))
+    }
+
     fn unsupported_container_action(
         &self,
         id: &str,
         action: &str,
     ) -> std::result::Result<Reply, ApiError> {
         match action {
-            "attach" | "attach/ws" | "exec" | "logs" | "stats" | "top" | "changes" | "export"
+            "attach" | "attach/ws" | "exec" | "stats" | "top" | "changes" | "export"
             | "archive" | "pause" | "unpause" | "update" | "rename" | "resize" => {
                 Err(ApiError::from(Error::unsupported(format!(
                     "container endpoint /containers/{id}/{action} is not implemented"
@@ -1409,6 +1482,199 @@ fn now_nano() -> i64 {
         .unwrap_or_else(|| Utc::now().timestamp() * 1_000_000_000)
 }
 
+/// Content type for `/containers/{id}/logs`: TTY allocation is rejected at
+/// container create, so responses are always stdcopy-multiplexed (Moby picks
+/// `multiplexed-stream` for non-TTY containers since API 1.42, our minimum
+/// advertised version).
+const VIEW_MULTIPLEXED_STREAM: &str = "application/vnd.docker.multiplexed-stream";
+
+/// Long-lived `/containers/{id}/logs?follow=1` response body. Framed backlog
+/// first, then new records until the container's captured pipes reach EOF,
+/// the store is force-closed, `until` passes, or the client disconnects.
+/// Layout mirrors [`EventStream`].
+struct EntryStream {
+    store: Arc<LogStore>,
+    replay: VecDeque<Vec<u8>>,
+    next: u64,
+    stream: Option<LogStreamSource>,
+    timestamps: bool,
+    since_nanos: Option<i64>,
+    until_nanos: Option<i64>,
+    current: Vec<u8>,
+    offset: usize,
+    closed: bool,
+}
+
+impl EntryStream {
+    /// Keep a record when it is inside the `since`/`until` window. Backlog
+    /// records were filtered before construction; this guards live records.
+    fn keeps(&self, entry: &LogEntry) -> bool {
+        self.since_nanos
+            .is_none_or(|since| entry.timestamp_nanos >= since)
+            && self
+                .until_nanos
+                .is_none_or(|until| entry.timestamp_nanos <= until)
+    }
+}
+
+impl Read for EntryStream {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if self.offset < self.current.len() {
+                let available = &self.current[self.offset..];
+                let count = available.len().min(output.len());
+                output[..count].copy_from_slice(&available[..count]);
+                self.offset += count;
+                return Ok(count);
+            }
+            self.current.clear();
+            self.offset = 0;
+            if self.closed {
+                return Ok(0);
+            }
+            if let Some(until) = self.until_nanos {
+                if now_nano() >= until {
+                    self.closed = true;
+                    return Ok(0);
+                }
+            }
+            if let Some(backlog) = self.replay.pop_front() {
+                self.current = backlog;
+                continue;
+            }
+            // Snapshot + closed-flag read atomically so a record appended
+            // right before the close flip cannot be missed.
+            let (entries, closed) = self.store.entries_and_state(self.next, self.stream);
+            for entry in &entries {
+                self.next = entry.seq + 1;
+                if self.keeps(entry) {
+                    self.current
+                        .extend_from_slice(&frame_entry(entry, self.timestamps));
+                }
+            }
+            if !self.current.is_empty() {
+                continue;
+            }
+            if closed {
+                // All stored records were drained and no more can arrive.
+                self.closed = true;
+                continue;
+            }
+            self.store
+                .wait_for_change(self.next, Duration::from_millis(100));
+        }
+    }
+}
+
+/// Frame one record with Moby's stdcopy header: stream id byte, three zero
+/// bytes, and a BE u32 payload length. With `timestamps`, the fixed-width
+/// `rfc3339NanoFixed` stamp is part of the payload exactly like Moby's
+/// `WriteLogStream`.
+fn frame_entry(entry: &LogEntry, timestamps: bool) -> Vec<u8> {
+    let mut payload = Vec::new();
+    if timestamps {
+        payload.extend_from_slice(log_stamp(entry.timestamp_nanos).as_bytes());
+        payload.push(b' ');
+    }
+    payload.extend_from_slice(&entry.data);
+    frame_bytes(entry.stream.frame_id(), &payload)
+}
+
+fn frame_bytes(stream_id: u8, payload: &[u8]) -> Vec<u8> {
+    // Records come from an 8 KiB read window, so the u32 length field cannot
+    // overflow; still chunk defensively so framing stays valid.
+    let mut out = Vec::with_capacity(payload.len() + 8);
+    let mut start = 0;
+    while start < payload.len() {
+        let end = (start + usize::try_from(u32::MAX).unwrap_or(usize::MAX)).min(payload.len());
+        let chunk = &payload[start..end];
+        out.push(stream_id);
+        out.extend_from_slice(&[0, 0, 0]);
+        out.extend_from_slice(&u32::try_from(chunk.len()).unwrap_or(u32::MAX).to_be_bytes());
+        out.extend_from_slice(chunk);
+        start = end;
+    }
+    out
+}
+
+/// Fixed-width RFC3339Nano stamp like Moby's `rfc3339NanoFixed`, UTC.
+fn log_stamp(nanos: i64) -> String {
+    let seconds = nanos.div_euclid(1_000_000_000);
+    let subsec = nanos.rem_euclid(1_000_000_000);
+    match chrono::DateTime::from_timestamp(seconds, u32::try_from(subsec).unwrap_or(0)) {
+        Some(stamp) => format!("{}.{subsec:0>9}Z", stamp.format("%Y-%m-%dT%H:%M:%S")),
+        None => "1970-01-01T00:00:00.000000000Z".to_string(),
+    }
+}
+
+/// Keep the last `tail` lines of a filtered record sequence, mirroring
+/// Moby's logreader: `tail` applies after stream/time filtering, negatives
+/// mean every line, `0` nothing, and a cut can split a record at a committed
+/// newline so no line is dropped nor duplicated.
+fn tail_slice(entries: &[LogEntry], tail: i64) -> Vec<LogEntry> {
+    if entries.is_empty() || tail < 0 {
+        return entries.to_vec();
+    }
+    let mut kept = 0i64;
+    for index in (0..entries.len()).rev() {
+        let lines = count_lines(&entries[index]);
+        if kept + lines > tail {
+            // Earlier entries are dropped entirely; this entry may give up
+            // `tail - kept` of its trailing lines (0 when the tail budget is
+            // already spent, which drops it too).
+            let to_keep = tail - kept;
+            if to_keep <= 0 {
+                return entries[index + 1..].to_vec();
+            }
+            let to_skip = (lines - to_keep).max(0) as usize;
+            let start = entries[index + 1..].to_vec();
+            let mut cut = Vec::with_capacity(start.len() + 1);
+            let head = &entries[index];
+            cut.push(LogEntry {
+                seq: head.seq,
+                stream: head.stream,
+                timestamp_nanos: head.timestamp_nanos,
+                data: Arc::from(head.data[offset_after_lines(&head.data, to_skip)..].to_vec()),
+            });
+            cut.extend(start);
+            return cut;
+        }
+        kept += lines;
+    }
+    entries.to_vec()
+}
+
+/// Number of lines in a record: committed newlines plus a final partial
+/// line (Moby treats an unterminated record as its own line).
+fn count_lines(entry: &LogEntry) -> i64 {
+    let newlines = entry.data.iter().filter(|&&byte| byte == b'\n').count() as i64;
+    match entry.data.last() {
+        Some(b'\n') => newlines,
+        Some(_) => newlines + 1,
+        None => 0,
+    }
+}
+
+/// Byte offset just past the `skip`-th newline of `data`.
+fn offset_after_lines(data: &[u8], skip: usize) -> usize {
+    if skip == 0 {
+        return 0;
+    }
+    let mut seen = 0usize;
+    for (index, &byte) in data.iter().enumerate() {
+        if byte == b'\n' {
+            seen += 1;
+            if seen == skip {
+                return index + 1;
+            }
+        }
+    }
+    0 // unreachable: skip < line count is guaranteed by the caller
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1475,5 +1741,145 @@ mod tests {
         assert!(String::from_utf8(body)
             .unwrap()
             .contains("\"action\":\"start\""));
+    }
+
+    fn entry(seq: u64, stream: LogStreamSource, data: &str) -> LogEntry {
+        LogEntry {
+            seq,
+            stream,
+            timestamp_nanos: 1_748_000_000_000_000_000,
+            data: Arc::from(data.as_bytes().to_vec()),
+        }
+    }
+
+    #[test]
+    fn frames_follow_moby_stdcopy_layout() {
+        let frame = frame_bytes(1, b"hi");
+        assert_eq!(frame, vec![1, 0, 0, 0, 0, 0, 0, 2, b'h', b'i']);
+        // stderr uses stream id 2
+        let frame = frame_bytes(2, b"x");
+        assert_eq!(frame, vec![2, 0, 0, 0, 0, 0, 0, 1, b'x']);
+    }
+
+    #[test]
+    fn framed_payload_includes_timestamp_when_enabled() {
+        let stamp = log_stamp(1_748_000_000_000_000_000);
+        let entry = entry(0, LogStreamSource::Stdout, "line\n");
+        let with = frame_entry(&entry, true);
+        let without = frame_entry(&entry, false);
+        // Length field covers the stamp, one separating space, and payload.
+        let payload_len = u32::from_be_bytes(with[4..8].try_into().unwrap()) as usize;
+        assert_eq!(payload_len, with.len() - 8);
+        // Without the stamp the frame is just the raw payload.
+        assert_eq!(&without[8..], b"line\n");
+        let payload = String::from_utf8(with[8..].to_vec()).unwrap();
+        assert_eq!(payload, format!("{stamp} line\n"));
+    }
+
+    #[test]
+    fn log_stamp_is_fixed_width_rfc3339_nano() {
+        // 2025-05-23T... exactly one second past the zero nanos field.
+        let stamp = log_stamp(1_748_000_000_000_000_000);
+        assert_eq!(stamp.len(), "2025-05-23T00:00:00.000000000Z".len());
+        assert!(stamp.ends_with(".000000000Z"));
+        assert_eq!(log_stamp(0), "1970-01-01T00:00:00.000000000Z");
+    }
+
+    #[test]
+    fn tail_keeps_last_lines_splitting_records() {
+        // 6 lines across 3 records: "one\ntwo\n" | "three" | "four\nfive"
+        let lines = |seq, data| entry(seq, LogStreamSource::Stdout, data);
+        let records = vec![
+            lines(0, "one\ntwo\n"),
+            lines(1, "three"),
+            lines(2, "four\nfive"),
+        ];
+        let text = |entries: &[LogEntry]| -> String {
+            let mut out = String::new();
+            for record in entries {
+                out.push_str(std::str::from_utf8(&record.data).unwrap());
+            }
+            out
+        };
+        assert_eq!(text(&tail_slice(&records, -1)), "one\ntwo\nthreefour\nfive");
+        assert_eq!(text(&tail_slice(&records, 99)), "one\ntwo\nthreefour\nfive");
+        assert_eq!(text(&tail_slice(&records, 0)), "");
+        assert_eq!(text(&tail_slice(&records, 1)), "five");
+        assert_eq!(text(&tail_slice(&records, 2)), "four\nfive");
+        assert_eq!(text(&tail_slice(&records, 3)), "threefour\nfive");
+        assert_eq!(text(&tail_slice(&records, 4)), "two\nthreefour\nfive");
+        assert_eq!(text(&tail_slice(&records, 5)), "one\ntwo\nthreefour\nfive");
+    }
+
+    #[test]
+    fn log_stream_follows_records_until_last_writer_ends() {
+        let store = Arc::new(LogStore::new(1024));
+        let mut stream = EntryStream {
+            store: Arc::clone(&store),
+            replay: VecDeque::new(),
+            next: 0,
+            stream: None,
+            timestamps: false,
+            since_nanos: None,
+            until_nanos: None,
+            current: Vec::new(),
+            offset: 0,
+            closed: false,
+        };
+        // The container is producing output on a live writer lease: the
+        // stream must keep following instead of stopping at the first gap,
+        // and must end only after the lease is released (EOF).
+        let lease = store.take_writer();
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            lease.append(LogStreamSource::Stdout, b"hello\n");
+            std::thread::sleep(Duration::from_millis(20));
+            lease.append(LogStreamSource::Stdout, b"world\n");
+            std::thread::sleep(Duration::from_millis(20));
+            // Lease dropped here -> no writer remains -> stream EOF.
+        });
+        let mut body = Vec::new();
+        stream.read_to_end(&mut body).unwrap();
+        producer.join().unwrap();
+        let expected = {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&frame_bytes(1, b"hello\n"));
+            bytes.extend_from_slice(&frame_bytes(1, b"world\n"));
+            bytes
+        };
+        assert_eq!(body, expected);
+        assert!(stream.closed);
+        assert!(store.is_closed());
+    }
+
+    #[test]
+    fn log_stream_serves_backlog_frames_in_order() {
+        let store = Arc::new(LogStore::new(1024));
+        store.append(LogStreamSource::Stdout, b"first\n");
+        store.append(LogStreamSource::Stderr, b"second\n");
+        let backlog = tail_slice(&store.entries_from(0, None), -1);
+        let replay: VecDeque<Vec<u8>> = backlog
+            .iter()
+            .map(|entry| frame_entry(entry, false))
+            .collect();
+        let next = backlog.last().map_or(0, |entry| entry.seq + 1);
+        let mut stream = EntryStream {
+            store: Arc::clone(&store),
+            replay,
+            next,
+            stream: None,
+            timestamps: false,
+            since_nanos: None,
+            until_nanos: None,
+            current: Vec::new(),
+            offset: 0,
+            closed: false,
+        };
+        let mut buffer = [0u8; 4096];
+        let served = stream.read(&mut buffer).unwrap();
+        // The first read returns exactly the first backlog frame.
+        assert_eq!(&buffer[..served], &frame_bytes(1, b"first\n")[..]);
+        let served = stream.read(&mut buffer).unwrap();
+        assert_eq!(&buffer[..served], &frame_bytes(2, b"second\n")[..]);
     }
 }

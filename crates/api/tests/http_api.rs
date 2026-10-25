@@ -587,9 +587,21 @@ fn generated_names_filters_and_honest_errors() {
     assert!(bound.text().contains("Binds"));
 
     let id = generate_id(addr);
-    let logs = http(addr, "GET", &format!("/containers/{id}/logs"), None, None);
-    assert_eq!(logs.status, 501);
-    assert!(logs.text().contains("not implemented"));
+    // Moby's daemon/logs.go rejects requests that select no stream.
+    let streamless = http(addr, "GET", &format!("/containers/{id}/logs"), None, None);
+    assert_eq!(streamless.status, 400);
+    assert!(streamless.text().contains("at least one stream"));
+    // Both streams selected: created containers have no output yet, so the
+    // response is 200 with an empty multiplexed stream.
+    let empty = http(
+        addr,
+        "GET",
+        &format!("/containers/{id}/logs?stdout=1&stderr=1"),
+        None,
+        None,
+    );
+    assert_eq!(empty.status, 200);
+    assert_eq!(empty.text().len(), 0);
 
     let bad_signal = http(
         addr,

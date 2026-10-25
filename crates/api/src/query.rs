@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::DateTime;
 use docker_daemon::ContainerView;
@@ -374,6 +375,74 @@ impl EventOptions {
     }
 }
 
+/// Parsed `/containers/{id}/logs` query (Moby `container.LogsOptions`).
+///
+/// Semantics mirror `daemon/logs.go`: at least one of `stdout`/`stderr` must
+/// be selected, `tail` accepts `all` or a number (Moby falls back to `-1`,
+/// meaning every line, when the value does not parse), `until=0` is ignored,
+/// and `since`/`until` accept unix seconds (with optional fractional part),
+/// RFC3339, or relative Go durations like `42m`, exactly as Moby's
+/// `timetypes.ParseTimestamps` does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogsOptions {
+    pub follow: bool,
+    pub stdout: bool,
+    pub stderr: bool,
+    pub timestamps: bool,
+    pub since_nanos: Option<i64>,
+    pub until_nanos: Option<i64>,
+    /// Moby line tail: negative = every line, `0` = no backlog, positive =
+    /// the last `n` lines.
+    pub tail_lines: i64,
+}
+
+impl LogsOptions {
+    pub fn parse(query: &Query) -> Result<Self> {
+        let stdout = query.bool_value("stdout", false);
+        let stderr = query.bool_value("stderr", false);
+        if !stdout && !stderr {
+            // Both Moby's HTTP router (`conn_helpers.go` callers) and
+            // `daemon/logs.go` reject stream-less requests.
+            return Err(Error::invalid_argument(
+                "Bad parameters: you must choose at least one stream",
+            ));
+        }
+        if query.bool_value("details", false) {
+            // We do not capture Moby's extra attach attributes.
+            return Err(Error::unsupported(
+                "log details (extra attach attributes) are not implemented",
+            ));
+        }
+        let follow = query.bool_value("follow", false);
+        let timestamps = query.bool_value("timestamps", false);
+        // Moby parses with strconv.Atoi and treats failure as -1 (every
+        // line); the docker CLI's `--tail` flag defaults to `all`.
+        let tail_lines = query
+            .get("tail")
+            .unwrap_or("all")
+            .trim()
+            .parse::<i32>()
+            .map(i64::from)
+            .unwrap_or(-1);
+        let since = parse_log_timestamp(query.get("since"))?;
+        // Moby explicitly ignores `until=0` (daemon/logs.go) because the CLI
+        // historically sends the default zero value.
+        let until = match query.get("until") {
+            None | Some("") | Some("0") => None,
+            Some(_) => parse_log_timestamp(query.get("until"))?,
+        };
+        Ok(Self {
+            follow,
+            stdout,
+            stderr,
+            timestamps,
+            since_nanos: since,
+            until_nanos: until,
+            tail_lines,
+        })
+    }
+}
+
 /// Event filters evaluated before serialization.
 #[derive(Debug, Clone, Default)]
 pub struct EventFilters {
@@ -518,6 +587,128 @@ pub fn parse_timestamp(raw: Option<&str>) -> Result<Option<i64>> {
         .ok_or_else(|| Error::invalid_argument(format!("timestamp out of range: {raw}")))
 }
 
+/// Parse Moby's log `since`/`until` values: unix seconds (with optional
+/// fractional part), RFC3339, or a relative Go duration (`42m`, `1h30m`,
+/// `-90s`) anchored at now the way `timetypes.ParseTimestamps` does.
+pub fn parse_log_timestamp(raw: Option<&str>) -> Result<Option<i64>> {
+    if let Ok(nanos) = parse_timestamp(raw) {
+        return Ok(nanos);
+    }
+    let trimmed = raw.map(|value| value.trim()).unwrap_or("");
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let offset = parse_go_duration_nanos(trimmed)?;
+    let anchor = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as i128)
+        .unwrap_or(0);
+    let stamped = anchor - i128::from(offset);
+    let stamped = i64::try_from(stamped)
+        .map_err(|_| Error::invalid_argument(format!("timestamp out of range: {raw:?}")))?;
+    Ok(Some(stamped))
+}
+
+/// Parse Go's `time.ParseDuration` syntax (`1h30m`, `42m`, `1.5s`, `90ms`,
+/// `2h`): an optional sign followed by one or more decimal-with-fraction
+/// numbers paired with the units ns/us/(µs|μs)/ms/s/m/h. Integer-only values
+/// are rejected: they mean unix seconds, which `parse_timestamp` handles.
+fn parse_go_duration_nanos(raw: &str) -> Result<i64> {
+    let (negative, rest) = match raw.as_bytes().first() {
+        Some(b'-') => (true, &raw[1..]),
+        Some(b'+') => (false, &raw[1..]),
+        _ => (false, raw),
+    };
+    if rest.is_empty() {
+        return Err(Error::invalid_argument(format!(
+            "duration {raw:?} has no values"
+        )));
+    }
+    let mut total: i128 = 0;
+    let mut cursor = rest;
+    while !cursor.is_empty() {
+        // Number: digits with an optional fractional part.
+        let digits: String = cursor.chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() || cursor.starts_with('.') {
+            return Err(Error::invalid_argument(format!(
+                "duration {raw:?} is missing a number before a unit"
+            )));
+        }
+        let mut consumed = digits.len();
+        let mut fraction_digits: Option<String> = None;
+        if cursor[consumed..].starts_with('.') {
+            let rest = &cursor[consumed + 1..];
+            let fraction: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if fraction.is_empty() {
+                return Err(Error::invalid_argument(format!(
+                    "duration {raw:?} has a fraction with no digits"
+                )));
+            }
+            consumed += 1 + fraction.len();
+            fraction_digits = Some(fraction);
+        }
+        // Unit: the multi-byte mu variants are matched before plain units so
+        // `µs` is recognized instead of `m` + leftover characters.
+        let unit_nanos: i128 = if let Some(stripped) = cursor[consumed..].strip_prefix("µs") {
+            cursor = stripped;
+            1_000
+        } else if let Some(stripped) = cursor[consumed..].strip_prefix("μs") {
+            cursor = stripped;
+            1_000
+        } else {
+            let rest = &cursor[consumed..];
+            let unit_value = if let Some(stripped) = rest.strip_prefix("ns") {
+                cursor = stripped;
+                1
+            } else if let Some(stripped) = rest.strip_prefix("us") {
+                cursor = stripped;
+                1_000
+            } else if let Some(stripped) = rest.strip_prefix("ms") {
+                cursor = stripped;
+                1_000_000
+            } else if let Some(stripped) = rest.strip_prefix('s') {
+                cursor = stripped;
+                1_000_000_000
+            } else if let Some(stripped) = rest.strip_prefix('m') {
+                cursor = stripped;
+                60_000_000_000
+            } else if let Some(stripped) = rest.strip_prefix('h') {
+                cursor = stripped;
+                3_600_000_000_000
+            } else {
+                return Err(Error::invalid_argument(format!(
+                    "duration {raw:?} is missing a unit after {digits}.{}",
+                    fraction_digits.as_deref().unwrap_or("")
+                )));
+            };
+            unit_value
+        };
+        let integer: i128 = digits
+            .parse()
+            .map_err(|_| Error::invalid_argument(format!("duration {raw:?} overflows")))?;
+        let mut token = integer
+            .checked_mul(unit_nanos)
+            .ok_or_else(|| Error::invalid_argument(format!("duration {raw:?} overflows")))?;
+        if let Some(fraction) = &fraction_digits {
+            // Fractional part is rounded down like Go's scaling.
+            let scaled: i128 = fraction
+                .parse()
+                .map_err(|_| Error::invalid_argument(format!("duration {raw:?} overflows")))?;
+            let scale = 10i128
+                .checked_pow(u32::try_from(fraction.len()).unwrap_or(39))
+                .ok_or_else(|| Error::invalid_argument(format!("duration {raw:?} overflows")))?;
+            token += scaled * unit_nanos / scale;
+        }
+        total = total
+            .checked_add(token)
+            .ok_or_else(|| Error::invalid_argument(format!("duration {raw:?} overflows")))?;
+    }
+    let signed = if negative { -total } else { total };
+    i64::try_from(signed).map_err(|_| {
+        Error::invalid_argument(format!("duration {raw:?} is outside the supported range"))
+    })
+}
+
 impl fmt::Display for FilterSet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("{")?;
@@ -584,6 +775,94 @@ mod tests {
         );
         assert!(parse_timestamp(Some("not-a-time")).is_err());
         assert_eq!(parse_timestamp(None).unwrap(), None);
+    }
+
+    #[test]
+    fn parses_log_timestamps_with_relative_durations() {
+        assert_eq!(parse_log_timestamp(Some("0")).unwrap(), Some(0));
+        assert_eq!(
+            parse_log_timestamp(Some("1.5")).unwrap(),
+            Some(1_500_000_000)
+        );
+        assert_eq!(
+            parse_log_timestamp(Some("2024-01-01T00:00:00Z")).unwrap(),
+            Some(1_704_067_200_000_000_000)
+        );
+        assert_eq!(parse_log_timestamp(None).unwrap(), None);
+        assert_eq!(parse_log_timestamp(Some("")).unwrap(), None);
+        // Relative durations anchor at "now" minus the duration (Moby's
+        // timetypes.GetTimestamp), so they only need approximate bounds.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let ten_minutes = parse_log_timestamp(Some("10m")).unwrap().unwrap();
+        assert!(ten_minutes > now - 600 * 1_000_000_000 - 5_000_000_000);
+        assert!(ten_minutes < now - 600 * 1_000_000_000 + 5_000_000_000);
+        let hour_half = parse_log_timestamp(Some("1h30m")).unwrap().unwrap();
+        assert!(hour_half < ten_minutes);
+        // Negative durations move into the future, matching Go's semantics.
+        let future = parse_log_timestamp(Some("-90s")).unwrap().unwrap();
+        assert!(future > now + 90 * 1_000_000_000 - 5_000_000_000);
+        // Pure integers are unix seconds, not durations.
+        assert_eq!(
+            parse_log_timestamp(Some("42")).unwrap(),
+            Some(42_000_000_000)
+        );
+        assert!(parse_log_timestamp(Some("not-a-time")).is_err());
+    }
+
+    #[test]
+    fn parses_go_durations() {
+        assert_eq!(parse_go_duration_nanos("10m").unwrap(), 600 * 1_000_000_000);
+        assert_eq!(
+            parse_go_duration_nanos("1h30m").unwrap(),
+            5400 * 1_000_000_000
+        );
+        assert_eq!(parse_go_duration_nanos("90ms").unwrap(), 90_000_000);
+        assert_eq!(parse_go_duration_nanos("1.5s").unwrap(), 1_500_000_000);
+        assert_eq!(parse_go_duration_nanos("2us").unwrap(), 2_000);
+        assert_eq!(parse_go_duration_nanos("2µs").unwrap(), 2_000);
+        assert_eq!(parse_go_duration_nanos("2μs").unwrap(), 2_000);
+        assert_eq!(parse_go_duration_nanos("-90s").unwrap(), -90_000_000_000);
+        assert_eq!(parse_go_duration_nanos("+90s").unwrap(), 90_000_000_000);
+        assert_eq!(parse_go_duration_nanos("300ns").unwrap(), 300);
+        // Integer-only values are unix seconds, not durations.
+        assert!(parse_go_duration_nanos("42").is_err());
+        assert!(parse_go_duration_nanos("").is_err());
+        assert!(parse_go_duration_nanos("h").is_err());
+        assert!(parse_go_duration_nanos("1.s").is_err());
+    }
+
+    #[test]
+    fn parses_logs_options_like_moby() {
+        let query = Query::parse("stdout=1&stderr=1&follow=1&timestamps=1&tail=all").unwrap();
+        let options = LogsOptions::parse(&query).unwrap();
+        assert!(options.follow && options.stdout && options.stderr && options.timestamps);
+        assert_eq!(options.tail_lines, -1);
+
+        let query = Query::parse("stdout=1&stderr=1&tail=5&until=0").unwrap();
+        let options = LogsOptions::parse(&query).unwrap();
+        assert_eq!(options.tail_lines, 5);
+        assert_eq!(options.until_nanos, None);
+
+        let query = Query::parse("stderr=1&tail=garbage").unwrap();
+        let options = LogsOptions::parse(&query).unwrap();
+        assert_eq!(options.tail_lines, -1);
+
+        // Both streams unset is rejected like daemon/logs.go.
+        let query = Query::parse("follow=1").unwrap();
+        let error = LogsOptions::parse(&query).unwrap_err();
+        assert_eq!(error.kind(), docker_errors::ErrorKind::InvalidArgument);
+
+        // The extra attach attributes are not captured.
+        let query = Query::parse("stdout=1&stderr=1&details=1").unwrap();
+        let error = LogsOptions::parse(&query).unwrap_err();
+        assert_eq!(error.kind(), docker_errors::ErrorKind::Unsupported);
+
+        let query = Query::parse("stdout=1&stderr=1&since=2000-01-01T00:00:00Z").unwrap();
+        let options = LogsOptions::parse(&query).unwrap();
+        assert_eq!(options.since_nanos, Some(946_684_800_000_000_000));
     }
 
     #[test]

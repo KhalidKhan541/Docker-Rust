@@ -69,7 +69,7 @@ pub(crate) fn create_task(
     Ok(Box::new(OciTask::new(
         bundle,
         config.config.open_stdin,
-        runtime.capture_stdio,
+        runtime.capture_stdio || config.capture_stdio,
         init,
     )))
 }
