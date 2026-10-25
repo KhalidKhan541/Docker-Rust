@@ -1,11 +1,14 @@
 # Implementation Status
 
 Snapshot: Milestones A—D complete; Milestone E portable layer complete and the
-Linux execution backend compile-checked but not runnable on this host;
-Milestone F/G has a runnable container-lifecycle, image-management, and
-image-archive HTTP API plus a daemon binary. Registry pulls and Docker
-save/load are real and persistent; native process execution and rootfs
-materialization are still pending. Honest state of every layer.
+Linux execution backend verified on `ubuntu-latest` CI (fmt/clippy/build/tests
+all green; the root smoke step currently fails inside the runtime init helper
+and is being diagnosed with drained helper stderr); Milestone F/G has a
+runnable container-lifecycle, image-management, and image-archive HTTP API
+plus a daemon binary, now including per-container log capture and the
+`/containers/{id}/logs` endpoint. Registry pulls and Docker save/load are real
+and persistent; container stdio capture is real but memory-only. Honest state
+of every layer.
 
 ## Milestone status
 
@@ -16,7 +19,7 @@ materialization are still pending. Honest state of every layer.
 | C | Registry (distribution client) | **done** | 168 tests green (42 distribution unit + 8 registry integration added); fmt/clippy `-D warnings` clean |
 | D | Daemon core (containerd-equivalent orchestration) | **done** | 191 tests green (9 daemon unit + 14 daemon integration added); fmt/clippy `-D warnings` clean; actor + synthetic runtime |
 | E | OCI runtime (container execution) | **in progress** | 220 tests green (25 runtime unit + 4 runtime integration tests added); fmt/clippy clean on Windows and `x86_64-unknown-linux-gnu`; bundle generation + deterministic Windows `Unsupported` tested; Linux init helper compile-checked, not executed on this Windows host |
-| F/G | Engine HTTP API | **in progress — container + image + archive slices runnable** | 276 workspace tests green (21 `docker-api` unit + 9 loopback HTTP integration + 4 `docker-rsd` unit + 20 `docker-image-store` unit); fmt/clippy `-D warnings` clean; real Docker CLI v29.9.1 pull/save/load and Docker Hub smoke tests over TCP; native process execution/rootfs pending |
+| F/G | Engine HTTP API | **in progress — container + image + archive + logs slices runnable** | 276 workspace tests green (21 `docker-api` unit + 9 loopback HTTP integration + 4 `docker-rsd` unit + 20 `docker-image-store` unit); fmt/clippy `-D warnings` clean; real Docker CLI v29.9.1 pull/save/load and Docker Hub smoke tests over TCP; `/containers/{id}/logs` implemented over captured stdio (memory-only); native process execution/rootfs pending CI green |
 | H/I | Builder (buildkit-equivalent) | not started | dockerfile2llb module verified in pinned tree |
 | J | CLI | not started | `upstream/cli/cmd/docker/` verified |
 | K | Security hardening | not started | SECURITY_ANALYSIS.md review hooks defined |
@@ -73,10 +76,13 @@ execution parameters.
 | `tests` | `crates/runtime/tests/schema.rs`: a draft-04 subset validator loads `config-schema.json`, `state-schema.json`, `defs*.json`, and `config-linux.json` directly from `upstream/runtime-spec/schema/`; generated bundle and state documents validate, and a negative test proves required-field detection. `runtime_windows.rs`: create on this host returns `Unsupported` naming Linux and the current OS. Bundle/model unit tests cover env merge order, default hostname, namespace mapping, resources, bridge annotation, numeric users, rootfs checks, round-trip, and conflict handling. |
 
 Exit status: the portable bundle/schema/validation half is complete. The Linux
-execution half is written and compile-checked for `x86_64-unknown-linux-gnu`,
-but this Windows host has no Linux kernel/WSL/VM, so a real process has not
-been executed here. That is the remaining E verification gap, not a claimed
-success.
+execution half is written, compiles for `x86_64-unknown-linux-gnu`, and the
+whole workspace (including schema tests) is green on CI's
+`ubuntu-latest`. The remaining E verification gap is the root smoke test: the
+runtime init helper currently exits 101 (a Rust panic somewhere inside), and
+the helper's stderr is now drained and reported by the test plus mirrored into
+the CI job summary to identify the cause. Treat runtime behavior as unverified
+until that root step is green.
 
 ## Milestone F/G — what exists, file by file
 
@@ -87,14 +93,19 @@ success.
 | `docker-rsd` | Runnable daemon binary. Resolves `daemon.json`-style config and `DRC_*` environment overrides, initializes tracing, opens the image store, constructs the broker/synthetic runtime/actor, and serves the API on `--host` (default loopback `127.0.0.1:2375`). `--data-root`/`DRC_DATA_ROOT` selects the persistent image root. It deliberately rejects non-synthetic runtimes until a rootfs provider is connected, and rejects `npipe://`/`unix://` instead of pretending they work. |
 | `docker-events` | Bounded replay history (4096 events by default), atomic history-snapshot + subscribe (`subscribe_since`), `history_len`, `recv_timeout`, and lowercase action serialization matching Moby's wire JSON. |
 | `docker-container-model` / `docker-daemon` | `created_at` on records and `started_at`/`finished_at` on state snapshots, populated by actor lifecycle transitions and exposed through inspect/list. |
-| Tests | `crates/api/tests/http_api.rs`: a real loopback TCP client (Content-Length and chunked decoding) exercises version gates/headers, create/list/inspect/start/stop/restart/kill/wait/delete, generated names, short ids, filters, image defaults/create validation, image list/inspect/history/tag/delete, image save/load round-trip (OCI + legacy, gzip, platform filters), unsupported fields/endpoints, event replay/live streaming, and a real pull against an in-process loopback OCI registry fixture. `docker-image-store` unit tests cover persistence, resolution, delete/GC, reference canonicalization, platform selection, auth parsing, pull verification, archive export, legacy/gzip import, tag restoration, and traversal rejection. `docker-rsd` unit tests cover option parsing and explicit named-pipe rejection. Manual differential smoke tests used the pinned Docker CLI v29.9.1 against `docker-rsd`, pulled `alpine:3.20` from Docker Hub, and exercised `docker save`/`docker load`. |
+| `docker-runtime` / `docker-daemon` (logs) | `runtime` gains a per-task `RuntimeConfig::capture_stdio` switch: runtimes create owned pipes when set, claimed with `RuntimeTask::take_stdio`; the Linux runtime honors it on its init helper without changing the parent-side protocol. `docker-daemon` gains `logs.rs`: a bounded per-container ring store (`LogEntry { seq, stream, timestamp, data }`, 4 MiB default) with an atomic `entries_and_state` snapshot, `wait_for_change`, lease-based writer accounting so follow streams end exactly when the last capture pipe reaches EOF, plus close on exit/removal/shutdown and reopen on restart. `engine.rs` spawns one drain thread per claimed pipe, drops the stdin writer end (detached semantics), and exposes `Daemon::log_store(reference)` to the API. |
+| Tests | `crates/api/tests/http_api.rs`: a real loopback TCP client (Content-Length and chunked decoding) exercises version gates/headers, create/list/inspect/start/stop/restart/kill/wait/delete, generated names, short ids, filters, image defaults/create validation, image list/inspect/history/tag/delete, image save/load round-trip (OCI + legacy, gzip, platform filters), unsupported fields/endpoints, container logs (stream-less 400, empty 200 raw stream), event replay/live streaming, and a real pull against an in-process loopback OCI registry fixture. `docker-image-store` unit tests cover persistence, resolution, delete/GC, reference canonicalization, platform selection, auth parsing, pull verification, archive export, legacy/gzip import, tag restoration, and traversal rejection. `docker-rsd` unit tests cover option parsing and explicit named-pipe rejection. `docker-daemon`/`docker-api` unit tests cover ring eviction, stream filters, follow/lease liveness, stdcopy framing, rfc3339NanoFixed stamps, line-accurate tail slicing, and relative Go duration parsing. Manual differential smoke tests used the pinned Docker CLI v29.9.1 against `docker-rsd`, pulled `alpine:3.20` from Docker Hub, and exercised `docker save`/`docker load`. |
 
 What the real Docker CLI successfully exercised over
 `DOCKER_HOST=tcp://127.0.0.1:<port>`: `version`, `info`, `pull --platform
 linux/amd64`, `images`, `image inspect`, `tag`, `rmi`, `create`, `run -d`,
 `ps`, `inspect`, `start`, `stop`, `kill`, `rm`, `wait`, `events`, `save`, and
-`load` (including gzip archives). `logs` fails with the explicit 501
-unsupported message, as expected. A pull
+`load` (including gzip archives). `logs` now streams each container's captured
+stdio with stdcopy framing (`application/vnd.docker.multiplexed-stream`);
+synthetic-runtime containers never execute, so their logs are empty, and log
+options follow Moby semantics (`follow`, `timestamps`, `tail` incl. `all`,
+`since`/`until` with unix, RFC3339, and relative Go durations; `details`
+returns explicit unsupported). A pull
 without `--platform` honestly reports that the `windows/amd64` image is not
 present in Alpine's manifest list and lists the available platforms.
 
@@ -129,16 +140,21 @@ present in Alpine's manifest list and lists the available platforms.
   into a final summary, image deletion does not yet check container use, and
   the JSON index rename is not atomic on Windows.
 - `docker-rsd` serves the synthetic runtime. HTTP lifecycle behavior and
-  events are real, but no host process runs, `State.Pid` is zero, and logs
-  cannot exist. Foreground `docker run`/`docker attach` is therefore not
+  events are real, but no host process runs, `State.Pid` is zero, and captured
+  logs are therefore always empty. Foreground `docker run`/`docker attach` is
+  therefore not
   functional; detached lifecycle operations are.
 - The HTTP listener is TCP-only, unauthenticated, and unencrypted. The
   default is loopback; exposing it is unsafe. Unix sockets and Windows named
   pipes are rejected as `Unsupported`.
-- Container state is not persisted across `docker-rsd` restarts.
-- F/G API gaps, all explicit rather than silent: no `/logs`, attach, exec,
-  stats, top, changes, export, archive, pause/unpause, update, rename, or
-  resize; those subresources return 501. Unrouted paths return 404. Hijacked
+- Container state is not persisted across `docker-rsd` restarts, and captured
+  logs are memory-only: a bounded in-memory ring per container (4 MiB default),
+  lost on daemon restart, mirroring container records.
+- F/G API gaps, all explicit rather than silent: no attach, exec, stats, top,
+  changes, export, archive, pause/unpause, update, rename, or resize; those
+  subresources return 501. Logs themselves are implemented over the in-memory
+  capture store; log `details` (extra attach attributes) returns explicit
+  unsupported. Unrouted paths return 404. Hijacked
   multiplexed streams are not implemented.
 - Milestone E's Linux backend has not been executed on this Windows host.
   It is compile-checked only; treat runtime behavior as unverified until a

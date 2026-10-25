@@ -117,16 +117,20 @@ distribution client, including multi-platform selection and verified layer
 downloads; Docker/OCI save/load (`/images/get`, `/images/{name}/get`,
 `/images/load`) with legacy `manifest.json`, gzip input, and platform
 filtering; create-time image resolution and image default inheritance;
-`/events` history replay + live stream; Docker-cased DTOs with explicit
+`/events` history replay + live stream; `/containers/{id}/logs` over captured
+stdio (stdcopy framing, `follow`/`timestamps`/`tail`/`since`/`until` with
+Moby's error messages, relative Go durations, and lease-based follow EOF);
+Docker-cased DTOs with explicit
 rejection of unsupported fields; synchronous `tiny_http` transport; runnable
 `docker-rsd` binary over TCP with `--data-root`. Verified with curl-level
 integration tests, an in-process registry fixture, a live Docker Hub pull,
 and a manual Docker CLI v29.9.1 smoke test including save/load.
 
-Still pending: push/prune, image filters, `/logs`, attach/exec hijack,
+Still pending: push/prune, image filters, attach/exec hijack,
 stats/top, network and volume endpoints, image-rootfs materialization, and
 native execution in the daemon binary. Container state is in-memory only;
-image metadata and blobs persist.
+image metadata and blobs persist; captured logs stay in a bounded in-memory
+ring and are lost on daemon restart.
 
 Exit criterion partially met: curl/Docker-CLI container lifecycle and image
 pull/list/inspect/tag/delete/save/load work over HTTP, the version-gate
