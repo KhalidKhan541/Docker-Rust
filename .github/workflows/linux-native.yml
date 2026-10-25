@@ -20,6 +20,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config
 
+      # The runtime-spec schema tests read `upstream/runtime-spec/schema/`,
+      # which is gitignored by design (see docs/REVERSE_ENGINEERING.md).
+      # CI populates it at the same pinned revision as local checkouts.
+      - name: Fetch pinned runtime-spec schemas
+        run: |
+          mkdir -p upstream/runtime-spec
+          curl -fsSL -o /tmp/runtime-spec.tar.gz \
+            "https://codeload.github.com/opencontainers/runtime-spec/tar.gz/92249139eea7161e13745abd4cb6d0ea02a3227a"
+          echo "fbed724a4bbdce2260eea9a4d6dcf534a5e2446e581ed1b8bf27abe536cee17a  /tmp/runtime-spec.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/runtime-spec.tar.gz --strip-components=1 -C upstream/runtime-spec
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
