@@ -605,6 +605,9 @@ impl Engine {
         self.store.put(record.clone())?;
         if let Err(error) = self.persist_record(&record) {
             let _ = self.store.remove(&id);
+            if let Some(dir) = &self.container_dir {
+                let _ = dir.remove(&id);
+            }
             return Err(error);
         }
         let logs = match self.open_logs(&id) {
@@ -1443,7 +1446,16 @@ impl Engine {
         updated.state.exit_code = Some(exit.exit_code);
         updated.state.error_signal = exit.signal.map(|signal| signal.as_str().to_string());
         updated.state.finished_at = Some(unix_now());
-        self.persist_record(&updated)?;
+        // The process exit is an external fact: never keep the actor thinking a
+        // container is running because the disk write failed. A stale `running`
+        // record is repaired to `exited`/255 by the next daemon start.
+        if let Err(error) = self.persist_record(&updated) {
+            tracing::error!(
+                container = %id.as_str(),
+                error = %error,
+                "cannot persist the exit state; the record on disk is stale"
+            );
+        }
         self.store.get_mut(id)?.state = updated.state;
         Ok(())
     }
@@ -1458,7 +1470,13 @@ impl Engine {
             started_at: updated.state.started_at,
             finished_at: Some(unix_now()),
         };
-        self.persist_record(&updated)?;
+        if let Err(error) = self.persist_record(&updated) {
+            tracing::error!(
+                container = %id.as_str(),
+                error = %error,
+                "cannot persist the dead state; the record on disk is stale"
+            );
+        }
         self.store.get_mut(id)?.state = updated.state;
         Ok(())
     }
