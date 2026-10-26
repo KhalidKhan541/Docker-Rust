@@ -224,6 +224,7 @@ dependencies = [
 name = "docker-daemon"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "docker-common",
  "docker-container-model",
  "docker-errors",

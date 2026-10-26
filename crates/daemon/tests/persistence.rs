@@ -5,9 +5,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use docker_common::ImageRef;
-use docker_container_model::config::{ContainerConfig, HostConfig, Signal};
+use docker_container_model::config::{ContainerConfig, HostConfig, RestartPolicy, Signal};
 use docker_container_model::state::LifecycleState;
-use docker_daemon::{CreateRequest, Daemon, Runtime, SyntheticBehavior, SyntheticRuntime};
+use docker_daemon::{
+    CreateRequest, Daemon, LogStore, Runtime, Stream, SyntheticBehavior, SyntheticRuntime,
+};
 use docker_events::EventBroker;
 
 fn config() -> ContainerConfig {
@@ -104,4 +106,64 @@ fn a_running_container_is_reported_exited_after_a_restart() {
         LifecycleState::Running
     );
     daemon.stop("probe", Some(Duration::from_secs(1))).unwrap();
+}
+
+#[test]
+fn logs_survive_a_restart_and_are_deleted_with_the_container() {
+    let temp = tempfile::tempdir().unwrap();
+    let broker = Arc::new(EventBroker::new());
+
+    let daemon = spawn(temp.path(), Arc::clone(&broker));
+    let created = daemon
+        .create(CreateRequest::new(config()).with_name("logger"))
+        .unwrap();
+    drop(daemon);
+
+    let log_path = temp
+        .path()
+        .join("containers")
+        .join(created.id.as_str())
+        .join("logs.jsonl");
+    assert!(log_path.is_file(), "container log file was not created");
+    let store = LogStore::open(&log_path, 1024).unwrap();
+    store.append(Stream::Stdout, b"hello from before\n");
+    store.close();
+    drop(store);
+
+    let daemon = spawn(temp.path(), Arc::clone(&broker));
+    let logs = daemon.log_store("logger").unwrap().unwrap();
+    assert!(logs.is_closed());
+    let entries = logs.entries_from(0, None);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].data.as_ref(), b"hello from before\n");
+
+    daemon.remove("logger", false).unwrap();
+    assert!(!log_path.exists(), "remove kept the container log file");
+}
+
+#[test]
+fn restart_policy_containers_come_back_after_a_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let broker = Arc::new(EventBroker::new());
+
+    let daemon = spawn(temp.path(), Arc::clone(&broker));
+    let host = HostConfig {
+        restart_policy: RestartPolicy::Always,
+        ..HostConfig::default()
+    };
+    daemon
+        .create(
+            CreateRequest::new(config())
+                .with_name("always")
+                .with_host_config(host),
+        )
+        .unwrap();
+    daemon.start("always").unwrap();
+    drop(daemon);
+
+    let daemon = spawn(temp.path(), Arc::clone(&broker));
+    assert_eq!(
+        daemon.inspect("always").unwrap().state.status,
+        LifecycleState::Running
+    );
 }

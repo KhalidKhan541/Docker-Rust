@@ -5,6 +5,7 @@
 //!
 //! ```text
 //! containers/<id>/container.json   record (config, host config, state)
+//! containers/<id>/logs.jsonl       captured stdio (base64 chunks, append-only)
 //! containers/<id>/rootfs/          optional native root filesystem
 //! ```
 //!
@@ -35,6 +36,7 @@ use serde::{Deserialize, Serialize};
 
 const RECORD_FILE: &str = "container.json";
 const RECORD_TEMP: &str = "container.json.tmp";
+const LOG_FILE: &str = "logs.jsonl";
 const RECORD_VERSION: u32 = 1;
 
 /// Exit code recorded for a container whose process was lost with the daemon.
@@ -52,6 +54,14 @@ struct RecordRef<'a> {
 struct StoredRecord {
     version: u32,
     container: ContainerRecord,
+}
+
+/// One restored container plus whether it was alive when the daemon stopped.
+/// The daemon uses the flag to honor `--restart` policies.
+#[derive(Debug)]
+pub(crate) struct RestoredContainer {
+    pub(crate) record: ContainerRecord,
+    pub(crate) recovered: bool,
 }
 
 /// Root of the persisted container directories (`<data-root>/containers`).
@@ -74,6 +84,11 @@ impl ContainerDir {
 
     pub(crate) fn container_dir(&self, id: &ContainerId) -> PathBuf {
         self.root.join(id.as_str())
+    }
+
+    /// Where the container's captured output is appended.
+    pub(crate) fn log_path(&self, id: &ContainerId) -> PathBuf {
+        self.container_dir(id).join(LOG_FILE)
     }
 
     /// Write a complete record, replacing any previous version atomically.
@@ -141,10 +156,11 @@ impl ContainerDir {
     /// Load every persisted record in stable directory order.
     ///
     /// Containers that were alive at the last shutdown are normalized to
-    /// `exited` with [`LOST_EXIT_CODE`] and written back. A corrupt record or
-    /// an ID/directory mismatch fails startup: silently dropping a container
+    /// `exited` with [`LOST_EXIT_CODE`] and written back, and flagged so the
+    /// engine can apply their restart policy. A corrupt record or an
+    /// ID/directory mismatch fails startup: silently dropping a container
     /// would be worse than refusing to start with an actionable error.
-    pub(crate) fn restore(&self) -> Result<Vec<ContainerRecord>> {
+    pub(crate) fn restore(&self) -> Result<Vec<RestoredContainer>> {
         let entries = fs::read_dir(&self.root).map_err(|error| {
             Error::internal(format!(
                 "reading container directory `{}`: {error}",
@@ -218,7 +234,8 @@ impl ContainerDir {
                     record.id
                 )));
             }
-            if record.state.status.is_alive() {
+            let recovered = record.state.status.is_alive();
+            if recovered {
                 let previous = record.state.status.as_api_status();
                 record.state = StateSnapshot {
                     status: LifecycleState::Exited,
@@ -234,7 +251,7 @@ impl ContainerDir {
                     "container process was lost with the daemon; marking it exited"
                 );
             }
-            records.push(record);
+            records.push(RestoredContainer { record, recovered });
         }
         Ok(records)
     }
@@ -294,18 +311,19 @@ mod tests {
 
         let loaded = dir.restore().unwrap();
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].id, original.id);
-        assert_eq!(loaded[0].config, original.config);
-        assert_eq!(loaded[0].host_config, original.host_config);
-        assert_eq!(loaded[0].state, original.state);
+        assert!(!loaded[0].recovered);
+        assert_eq!(loaded[0].record.id, original.id);
+        assert_eq!(loaded[0].record.config, original.config);
+        assert_eq!(loaded[0].record.host_config, original.host_config);
+        assert_eq!(loaded[0].record.state, original.state);
 
         original.name = Some("renamed".into());
         original.state.exit_code = Some(7);
         dir.save(&original).unwrap();
         let loaded = dir.restore().unwrap();
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].name.as_deref(), Some("renamed"));
-        assert_eq!(loaded[0].state.exit_code, Some(7));
+        assert_eq!(loaded[0].record.name.as_deref(), Some("renamed"));
+        assert_eq!(loaded[0].record.state.exit_code, Some(7));
     }
 
     #[test]
@@ -318,15 +336,17 @@ mod tests {
 
         let loaded = dir.restore().unwrap();
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].state.status, LifecycleState::Exited);
-        assert_eq!(loaded[0].state.exit_code, Some(LOST_EXIT_CODE));
-        assert_eq!(loaded[0].state.started_at, Some(1_700_000_100));
-        assert!(loaded[0].state.finished_at.is_some());
+        assert!(loaded[0].recovered);
+        assert_eq!(loaded[0].record.state.status, LifecycleState::Exited);
+        assert_eq!(loaded[0].record.state.exit_code, Some(LOST_EXIT_CODE));
+        assert_eq!(loaded[0].record.state.started_at, Some(1_700_000_100));
+        assert!(loaded[0].record.state.finished_at.is_some());
 
         // The normalized state is durable: a second restore does not rewrite
         // the exit code or finished-at timestamp.
         let again = dir.restore().unwrap();
-        assert_eq!(again[0].state, loaded[0].state);
+        assert!(!again[0].recovered);
+        assert_eq!(again[0].record.state, loaded[0].record.state);
     }
 
     #[test]

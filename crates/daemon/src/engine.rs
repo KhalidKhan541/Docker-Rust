@@ -21,7 +21,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use docker_common::{ContainerId, Digest, Name};
-use docker_container_model::config::{ContainerConfig, HostConfig, Signal};
+use docker_container_model::config::{ContainerConfig, HostConfig, RestartPolicy, Signal};
 use docker_container_model::state::{validate_transition, LifecycleState, StateSnapshot};
 use docker_container_model::store::{ContainerFilter, ContainerRecord, ContainerStore};
 use docker_errors::{Error, Result};
@@ -29,7 +29,7 @@ use docker_events::{event_now, Actor, EventAction, EventBroker, EventType, Known
 use serde::Serialize;
 
 use crate::logs::{LogStore, Stream, DEFAULT_LOG_CAPACITY};
-use crate::persist::ContainerDir;
+use crate::persist::{ContainerDir, RestoredContainer};
 use crate::restart::RestartManager;
 use crate::runtime::{ExitStatus, Runtime, RuntimeConfig, RuntimeTask};
 
@@ -148,7 +148,7 @@ impl Daemon {
         runtime: Arc<dyn Runtime>,
         broker: Arc<EventBroker>,
         container_dir: Option<ContainerDir>,
-        records: Vec<ContainerRecord>,
+        records: Vec<RestoredContainer>,
     ) -> Result<Self> {
         let (tx, rx) = mpsc::channel();
         let engine_tx = tx.clone();
@@ -344,13 +344,13 @@ struct Meta {
 }
 
 impl Meta {
-    fn new(host: &HostConfig) -> Self {
+    fn new(host: &HostConfig, logs: Arc<LogStore>) -> Self {
         Self {
             restart_manager: RestartManager::new(host.restart_policy, host.max_retry_count, 0),
             restart_count: 0,
             manually_stopped: false,
             last_exit: None,
-            logs: Arc::new(LogStore::new(DEFAULT_LOG_CAPACITY)),
+            logs,
         }
     }
 }
@@ -392,6 +392,9 @@ struct Engine {
     command_tx: Sender<Command>,
     /// `None` for an ephemeral daemon (tests and in-process callers).
     container_dir: Option<ContainerDir>,
+    /// Containers recovered from `running` (or paused/restarting) at startup.
+    /// The engine applies their restart policy before serving commands.
+    recovered: Vec<ContainerId>,
     shutting_down: bool,
     next_generation: u64,
 }
@@ -402,11 +405,13 @@ impl Engine {
         broker: Arc<EventBroker>,
         command_tx: Sender<Command>,
         container_dir: Option<ContainerDir>,
-        records: Vec<ContainerRecord>,
+        records: Vec<RestoredContainer>,
     ) -> Self {
         let mut store = ContainerStore::new();
         let mut meta = HashMap::new();
-        for record in records {
+        let mut recovered = Vec::new();
+        for restored in records {
+            let record = restored.record;
             let id = record.id.clone();
             if let Err(error) = store.put(record.clone()) {
                 tracing::error!(
@@ -416,7 +421,28 @@ impl Engine {
                 );
                 continue;
             }
-            meta.insert(id, Meta::new(&record.host_config));
+            let logs = match &container_dir {
+                Some(dir) => match LogStore::open(dir.log_path(&id), DEFAULT_LOG_CAPACITY) {
+                    Ok(store) => Arc::new(store),
+                    Err(error) => {
+                        tracing::error!(
+                            container = %id.as_str(),
+                            error = %error,
+                            "cannot restore container logs; using an empty in-memory buffer"
+                        );
+                        Arc::new(LogStore::new(DEFAULT_LOG_CAPACITY))
+                    }
+                },
+                None => Arc::new(LogStore::new(DEFAULT_LOG_CAPACITY)),
+            };
+            let entry = Meta::new(&record.host_config, logs);
+            // Nothing can append until the container is started, so a follow
+            // request on a restored container must see EOF after the replay.
+            entry.logs.close_if_idle();
+            meta.insert(id.clone(), entry);
+            if restored.recovered {
+                recovered.push(id);
+            }
         }
         Self {
             store,
@@ -428,12 +454,40 @@ impl Engine {
             broker,
             command_tx,
             container_dir,
+            recovered,
             shutting_down: false,
             next_generation: 0,
         }
     }
 
+    /// Honor restart policies for containers that were alive when the
+    /// previous daemon stopped. `no` keeps the recovered `exited` state.
+    fn restart_recovered(&mut self) {
+        for id in std::mem::take(&mut self.recovered) {
+            let policy = match self.store.get(&id) {
+                Ok(record) => record.host_config.restart_policy,
+                Err(_) => continue,
+            };
+            if policy == RestartPolicy::No {
+                continue;
+            }
+            tracing::info!(
+                container = %id.as_str(),
+                ?policy,
+                "restarting container recovered from the previous daemon"
+            );
+            if let Err(error) = self.start_task(&id, true) {
+                tracing::error!(
+                    container = %id.as_str(),
+                    error = %error,
+                    "cannot restart container after daemon restart"
+                );
+            }
+        }
+    }
+
     fn run(mut self, rx: Receiver<Command>) {
+        self.restart_recovered();
         loop {
             self.process_timers();
             let wait = self
@@ -553,7 +607,17 @@ impl Engine {
             let _ = self.store.remove(&id);
             return Err(error);
         }
-        self.meta.insert(id, Meta::new(&record.host_config));
+        let logs = match self.open_logs(&id) {
+            Ok(logs) => logs,
+            Err(error) => {
+                let _ = self.store.remove(&id);
+                if let Some(dir) = &self.container_dir {
+                    let _ = dir.remove(&id);
+                }
+                return Err(error);
+            }
+        };
+        self.meta.insert(id, Meta::new(&record.host_config, logs));
         self.emit_container(&record, KnownAction::Create, &[]);
         Ok(ContainerView::from_record(&record, 0))
     }
@@ -1342,6 +1406,16 @@ impl Engine {
         }
     }
 
+    fn open_logs(&self, id: &ContainerId) -> Result<Arc<LogStore>> {
+        match &self.container_dir {
+            Some(dir) => Ok(Arc::new(LogStore::open(
+                dir.log_path(id),
+                DEFAULT_LOG_CAPACITY,
+            )?)),
+            None => Ok(Arc::new(LogStore::new(DEFAULT_LOG_CAPACITY))),
+        }
+    }
+
     fn set_running(&mut self, id: &ContainerId) -> Result<()> {
         let mut updated = self.store.get(id)?.clone();
         validate_transition(updated.state.status, LifecycleState::Running)?;
@@ -1392,16 +1466,18 @@ impl Engine {
     fn remove_record(&mut self, id: &ContainerId) -> Result<()> {
         let record = self.store.get(id)?.clone();
         self.runtime.cleanup(id)?;
+        // Force-close the log store so any follower stream ends even if a
+        // capture thread is still draining a lingering pipe. `close` also
+        // flushes and drops the log file handle, which Windows requires before
+        // the directory can be removed.
+        if let Some(meta) = self.meta.get(id) {
+            meta.logs.close();
+        }
         // Remove the on-disk record before dropping the in-memory one: if the
         // directory cannot be removed, the container stays addressable instead
         // of reappearing after the next daemon start.
         if let Some(dir) = &self.container_dir {
             dir.remove(id)?;
-        }
-        // Force-close the log store so any follower stream ends even if a
-        // capture thread is still draining a lingering pipe.
-        if let Some(meta) = self.meta.get(id) {
-            meta.logs.close();
         }
         self.store.remove(id)?;
         self.meta.remove(id);

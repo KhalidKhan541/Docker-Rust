@@ -9,6 +9,7 @@ description = "Single-owner daemon orchestration core: lifecycle actor, restart 
 unsafe_code = "forbid"
 
 [dependencies]
+base64 = { workspace = true }
 docker-errors = { workspace = true }
 docker-common = { workspace = true }
 docker-events = { workspace = true }
