@@ -127,9 +127,26 @@ if [ "$exit_code" != "0" ]; then
     echo "linux-native-smoke: container did not exit successfully (state=$state exit=$exit_code)" >&2
     exit 1
 fi
-if ! grep -q "native-runtime-ok" "$WORK/daemon.log"; then
+
+# The engine always captures container stdio into its log store (pipelines
+# feed `docker logs`), so the probe output is served by the logs endpoint
+# rather than appearing in the daemon's own stdout. Retry briefly because the
+# state flips to exited before the last capture pipe necessarily drains.
+seen=0
+for _ in $(seq 1 50); do
+    curl -fsS \
+        "http://127.0.0.1:$PORT/containers/probe/logs?stdout=1&stderr=1&follow=1" \
+        -o "$WORK/probe.logs" || true
+    if [ -f "$WORK/probe.logs" ] && grep -aq "native-runtime-ok" "$WORK/probe.logs"; then
+        seen=1
+        break
+    fi
+    sleep 0.1
+done
+if [ "$seen" -ne 1 ]; then
     cat "$WORK/daemon.log" >&2
-    echo "linux-native-smoke: probe output was not observed" >&2
+    echo "linux-native-smoke: probe output was not served by the logs endpoint" >&2
+    cat "$WORK/probe.logs" >&2 || true
     exit 1
 fi
 
