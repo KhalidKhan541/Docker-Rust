@@ -1,14 +1,14 @@
 # Implementation Status
 
-Snapshot: Milestones A—D complete; Milestone E portable layer complete and the
-Linux execution backend verified on `ubuntu-latest` CI (fmt/clippy/build/tests
-all green; the root smoke step currently fails inside the runtime init helper
-and is being diagnosed with drained helper stderr); Milestone F/G has a
-runnable container-lifecycle, image-management, and image-archive HTTP API
-plus a daemon binary, now including per-container log capture and the
-`/containers/{id}/logs` endpoint. Registry pulls and Docker save/load are real
-and persistent; container stdio capture is real but memory-only. Honest state
-of every layer.
+Snapshot: Milestones A—E complete. Milestone E's Linux backend is verified on
+`ubuntu-latest` CI: fmt/clippy/build/tests are green, the root smoke test
+executes a real process in a materialized rootfs, and the Engine API smoke
+test runs a container end-to-end through `docker-rsd --runtime oci` and serves
+its output from `/containers/{id}/logs`. Milestone F/G has a runnable
+container-lifecycle, image-management, and image-archive HTTP API plus a
+daemon binary, including per-container log capture. Registry pulls and Docker
+save/load are real and persistent; container stdio capture is real but
+memory-only. Honest state of every layer.
 
 ## Milestone status
 
@@ -18,8 +18,8 @@ of every layer.
 | B | Image & content addressable store | **done** | 114 tests green (31 new); fmt/clippy `-D warnings` clean; crates listed below |
 | C | Registry (distribution client) | **done** | 168 tests green (42 distribution unit + 8 registry integration added); fmt/clippy `-D warnings` clean |
 | D | Daemon core (containerd-equivalent orchestration) | **done** | 191 tests green (9 daemon unit + 14 daemon integration added); fmt/clippy `-D warnings` clean; actor + synthetic runtime |
-| E | OCI runtime (container execution) | **in progress** | 220 tests green (25 runtime unit + 4 runtime integration tests added); fmt/clippy clean on Windows and `x86_64-unknown-linux-gnu`; bundle generation + deterministic Windows `Unsupported` tested; Linux init helper compile-checked, not executed on this Windows host |
-| F/G | Engine HTTP API | **in progress — container + image + archive + logs slices runnable** | 276 workspace tests green (21 `docker-api` unit + 9 loopback HTTP integration + 4 `docker-rsd` unit + 20 `docker-image-store` unit); fmt/clippy `-D warnings` clean; real Docker CLI v29.9.1 pull/save/load and Docker Hub smoke tests over TCP; `/containers/{id}/logs` implemented over captured stdio (memory-only); native process execution/rootfs pending CI green |
+| E | OCI runtime (container execution) | **done — verified on Linux CI** | 25 runtime unit + 4 runtime integration tests; fmt/clippy clean on Windows and `x86_64-unknown-linux-gnu`; deterministic Windows `Unsupported`; the `ubuntu-latest` root smoke test executes a real static process through namespace unshare, chroot, `/proc` mount, and identity drop in a materialized image rootfs; `docker-rsd --runtime oci` runs the same probe over the Engine API |
+| F/G | Engine HTTP API | **in progress — container + image + archive + logs slices runnable** | 293 workspace tests green (30 `docker-api` unit + 9 loopback HTTP integration + 4 `docker-rsd` unit + 28 `docker-image-store` unit); fmt/clippy `-D warnings` clean; real Docker CLI v29.9.1 pull/save/load and Docker Hub smoke tests over TCP; `/containers/{id}/logs` implemented over captured stdio (memory-only); `docker-rsd --runtime oci` executes a loaded image end-to-end on `ubuntu-latest` |
 | H/I | Builder (buildkit-equivalent) | not started | dockerfile2llb module verified in pinned tree |
 | J | CLI | not started | `upstream/cli/cmd/docker/` verified |
 | K | Security hardening | not started | SECURITY_ANALYSIS.md review hooks defined |
@@ -75,17 +75,17 @@ execution parameters.
 | `docker-daemon` | `runtime.rs` now re-exports the shared boundary; `engine.rs` constructs `RuntimeConfig::new(...)` and otherwise keeps the Milestone D supervisor unchanged. |
 | `tests` | `crates/runtime/tests/schema.rs`: a draft-04 subset validator loads `config-schema.json`, `state-schema.json`, `defs*.json`, and `config-linux.json` directly from `upstream/runtime-spec/schema/`; generated bundle and state documents validate, and a negative test proves required-field detection. `runtime_windows.rs`: create on this host returns `Unsupported` naming Linux and the current OS. Bundle/model unit tests cover env merge order, default hostname, namespace mapping, resources, bridge annotation, numeric users, rootfs checks, round-trip, and conflict handling. |
 
-Exit status: the portable bundle/schema/validation half is complete. The Linux
-execution half is written, compiles for `x86_64-unknown-linux-gnu`, and the
-whole workspace (including schema tests) is green on CI's `ubuntu-latest`.
-The root smoke test's init-helper panic is diagnosed and fixed: stage 1 spawned
-its signal-forwarding thread *after* `unshare(CLONE_NEWPID)`, and the kernel
-rejects `clone(CLONE_THREAD)` with `EINVAL` once `pid_ns_for_children` differs
-from the active PID namespace (threads cannot join another PID namespace;
-`unshare` also requires a single-threaded caller). Stage 1 now stays
-single-threaded and uses a blocked signal mask plus `signalfd`, with `SIGCHLD`
-reaping stage 2. A fresh `ubuntu-latest` run must confirm the flow before
-runtime behavior is marked verified.
+Exit status: complete and verified. The portable bundle/schema/validation half
+is covered by unit and schema tests. On `ubuntu-latest`, the root smoke test
+executes a static probe inside a materialized image rootfs, and the Engine API
+smoke test loads an OCI archive, creates and starts a container through
+`docker-rsd --runtime oci`, and reads the probe output back from
+`/containers/{id}/logs`. Two real defects were fixed to get there: stage 1
+spawned its signal-forwarding thread *after* `unshare(CLONE_NEWPID)`, and the
+kernel rejects `clone(CLONE_THREAD)` with `EINVAL` once `pid_ns_for_children`
+differs from the active PID namespace (stage 1 now uses a blocked mask plus
+`signalfd`, with `SIGCHLD` reaping stage 2), and the archive importer rejected
+GNU tar's `./` root directory entry as an unsafe path.
 
 ## Milestone F/G — what exists, file by file
 
@@ -93,7 +93,7 @@ runtime behavior is marked verified.
 |-------|----------|
 | `docker-api` | `version.rs`: API `1.24`–`1.51` gate with upstream-compatible too-old/too-new messages and `/vX.Y` path-prefix parsing. `dto.rs`: explicit Moby-cased wire DTOs for version/info/create/list/inspect, conversion to the internal model, image-default inheritance, and rejection of non-empty unsupported fields. `image_dto.rs`: Docker image summary/inspect/history/pull/load/delete wire shapes. `query.rs`: query decoding with Docker boolean semantics, timestamp parsing, list/event filters, and explicit rejection of unimplemented filters. `server.rs`: synchronous `tiny_http` transport over the daemon actor and image store; `/_ping`, `/version`, `/info`, container CRUD/lifecycle/wait, image list/pull/inspect/history/tag/delete, `/images/get`, `/images/{name}/get`, `/images/load`, and `/events`; 64 GiB archive spooling, OCI-platform query decoding, newline-delimited load status; shared `Api-Version` headers and `{"message":...}` errors; Moby `304` start/stop semantics; chunked live event streaming. |
 | `docker-image-store` | Persistent `<data-root>/images/images.json` reference index plus verified-CAS blobs. Canonical/familiar Docker reference normalization, tag/repository-digest canonical keys, ID/prefix/tag/digest resolution, tag moves, conservative untag/delete + blob GC, direct manifest pulls through `docker-distribution`, multi-platform index selection, config/layer descriptor size and digest verification, host-platform default, loopback plain-HTTP registries, and Basic/anonymous `X-Registry-Auth` parsing. `archive.rs` writes OCI layout plus legacy `manifest.json`, copies verified layer blobs, and imports OCI or legacy plain/gzip tar archives with path-traversal guards, entry/byte limits, digest/diffID verification, gzip support, and tag restoration. |
-| `docker-rsd` | Runnable daemon binary. Resolves `daemon.json`-style config and `DRC_*` environment overrides, initializes tracing, opens the image store, constructs the broker/synthetic runtime/actor, and serves the API on `--host` (default loopback `127.0.0.1:2375`). `--data-root`/`DRC_DATA_ROOT` selects the persistent image root. It deliberately rejects non-synthetic runtimes until a rootfs provider is connected, and rejects `npipe://`/`unix://` instead of pretending they work. |
+| `docker-rsd` | Runnable daemon binary. Resolves `daemon.json`-style config and `DRC_*` environment overrides, initializes tracing, opens the image store, constructs the broker/runtime/actor, and serves the API on `--host` (default loopback `127.0.0.1:2375`). `--data-root`/`DRC_DATA_ROOT` selects the persistent image root. `--runtime synthetic` (default) serves the in-process runtime; `--runtime oci` (alias `native`) wires `OciRuntime` to `ImageRootfsProvider`, which materializes image layers into `<data-root>/containers/<id>/rootfs` atomically, and preflights root and the init helper. `npipe://`/`unix://` are rejected instead of pretending they work. |
 | `docker-events` | Bounded replay history (4096 events by default), atomic history-snapshot + subscribe (`subscribe_since`), `history_len`, `recv_timeout`, and lowercase action serialization matching Moby's wire JSON. |
 | `docker-container-model` / `docker-daemon` | `created_at` on records and `started_at`/`finished_at` on state snapshots, populated by actor lifecycle transitions and exposed through inspect/list. |
 | `docker-runtime` / `docker-daemon` (logs) | `runtime` gains a per-task `RuntimeConfig::capture_stdio` switch: runtimes create owned pipes when set, claimed with `RuntimeTask::take_stdio`; the Linux runtime honors it on its init helper without changing the parent-side protocol. `docker-daemon` gains `logs.rs`: a bounded per-container ring store (`LogEntry { seq, stream, timestamp, data }`, 4 MiB default) with an atomic `entries_and_state` snapshot, `wait_for_change`, lease-based writer accounting so follow streams end exactly when the last capture pipe reaches EOF, plus close on exit/removal/shutdown and reopen on restart. `engine.rs` spawns one drain thread per claimed pipe, drops the stdin writer end (detached semantics), and exposes `Daemon::log_store(reference)` to the API. |
@@ -142,11 +142,12 @@ present in Alpine's manifest list and lists the available platforms.
   temporary files rather than streaming end to end. Pull progress is buffered
   into a final summary, image deletion does not yet check container use, and
   the JSON index rename is not atomic on Windows.
-- `docker-rsd` serves the synthetic runtime. HTTP lifecycle behavior and
-  events are real, but no host process runs, `State.Pid` is zero, and captured
-  logs are therefore always empty. Foreground `docker run`/`docker attach` is
-  therefore not
-  functional; detached lifecycle operations are.
+- `docker-rsd` defaults to the synthetic runtime: HTTP lifecycle behavior and
+  events are real, but no host process runs and `State.Pid` is zero, so
+  captured logs are empty. `--runtime oci` executes real containers and
+  captures their stdio. Foreground `docker run`/`docker attach` remain
+  unavailable because attach/hijack is not implemented; detached lifecycle
+  operations are.
 - The HTTP listener is TCP-only, unauthenticated, and unencrypted. The
   default is loopback; exposing it is unsafe. Unix sockets and Windows named
   pipes are rejected as `Unsupported`.
@@ -159,28 +160,27 @@ present in Alpine's manifest list and lists the available platforms.
   capture store; log `details` (extra attach attributes) returns explicit
   unsupported. Unrouted paths return 404. Hijacked
   multiplexed streams are not implemented.
-- Milestone E's Linux backend has not been executed on this Windows host.
-  It is compile-checked only; treat runtime behavior as unverified until a
-  Linux host or VM runs the helper.
+- Milestone E's Linux backend is verified on `ubuntu-latest` CI (both root
+  smoke steps). This Windows host still cannot execute it locally because it
+  has no Linux kernel, WSL distro, or VM.
 - E execution limitations, all explicit errors rather than silent fallbacks:
-  no rootfs extraction/materialization from the image store (callers must
-  supply `RuntimeConfig::with_rootfs`); no cgroups (memory/CPU/pids limits
-  are accepted by the bundle builder but rejected by `ensure_supported`);
-  no capability dropping, seccomp, AppArmor/SELinux, user namespaces,
-  TTY/console allocation, additional mounts, hooks, devices, bridge
-  networking, or custom rlimits. Root in the container retains the helper's
-  initial-user-namespace capabilities, so this backend is not yet a security
-  boundary (Milestone K). `/proc` is mounted, but `/dev`, `/dev/pts`, `/sys`,
-  `/etc/hosts`, and `/etc/resolv.conf` are not; `none` networking leaves
-  loopback down; stop/delete uses the helper process group rather than a
-  cgroup, so a process that creates a new session can escape it.
-- Daemon limitations kept explicit: `SyntheticRuntime` is the only runtime
-  wired into `docker-rsd`; `OciRuntime` implements the same `Runtime` trait
-  but the image/rootfs layer that would supply it is not connected yet.
-  There is no pause/unpause, no persistence/reconnect across daemon restart,
-  and no negative (wait-forever) stop timeout. Start/stop no-ops are now
-  translated to upstream's 304 by the HTTP layer, and unnamed API creates
-  receive a generated `docker-rs_<12-hex>` name.
+  `docker-rsd` materializes image rootfs through `ImageRootfsProvider` (crate
+  callers must supply a rootfs or provider); no cgroups (memory/CPU/pids
+  limits are accepted by the bundle builder but rejected by
+  `ensure_supported`); no capability dropping, seccomp, AppArmor/SELinux,
+  user namespaces, TTY/console allocation, additional mounts, hooks, devices,
+  bridge networking, or custom rlimits. Root in the container retains the
+  helper's initial-user-namespace capabilities, so this backend is not yet a
+  security boundary (Milestone K). `/proc` is mounted, but `/dev`, `/dev/pts`,
+  `/sys`, `/etc/hosts`, and `/etc/resolv.conf` are not; `none` networking
+  leaves loopback down; stop/delete uses the helper process group rather than
+  a cgroup, so a process that creates a new session can escape it.
+- Daemon limitations kept explicit: `docker-rsd` defaults to the synthetic
+  runtime; `--runtime oci` (alias `native`) runs real Linux containers.
+  There is no pause/unpause, no container/log persistence or reattach across
+  daemon restart, and no negative (wait-forever) stop timeout. Start/stop
+  no-ops are translated to upstream's 304 by the HTTP layer, and unnamed API
+  creates receive a generated `docker-rs_<12-hex>` name.
 - Registry client: no cross-repository blob mount (every push does `HEAD`
   and then a full upload), no single-`POST` monolithic upload (optional in
   the spec), schema 1 manifests rejected rather than parsed, no Docker

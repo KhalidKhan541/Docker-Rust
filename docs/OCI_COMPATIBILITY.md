@@ -16,7 +16,7 @@ Sources of truth harvested from `upstream/runtime-spec/`:
   field-for-field identically (`ociVersion`, `process.env`, `root.path`,
   `hooks.startContainer`, …).
 
-Current status (Milestone E, portable layer complete): `docker-runtime`
+Current status (Milestone E, complete): `docker-runtime`
 contains the runtime-spec 1.3.0 Linux `Spec`/`State` types and emits
 `config.json` from the daemon's container model. Generated bundles validate
 against the pinned `config-schema.json` (including `defs.json`,
@@ -54,15 +54,17 @@ labels, capability sets, devices, rlimits, sysctls, and user namespaces are
 also explicit `Unsupported` errors rather than ignored fields.
 
 Execution status: the Windows host returns `Unsupported`. The Linux backend
-is compile-checked for `x86_64-unknown-linux-gnu` (two-stage init; stage 2
-mounts procfs only after entering the PID namespace) but has not been run in
-this environment. See `IMPLEMENTATION_STATUS.md` for the explicit E gaps.
+is verified on `ubuntu-latest` CI: a static probe runs through unshare,
+chroot, procfs mounted after entering the PID namespace, and the identity
+drop, and the Engine API smoke runs the same probe through
+`docker-rsd --runtime oci`. See `IMPLEMENTATION_STATUS.md` for the explicit E
+gaps.
 
-Known Linux backend gaps (all deliberate, not silent): no rootfs extraction
-from the image store; no cgroups, capability dropping, seccomp, or LSM
-policy; no TTY, `/dev`, `/dev/pts`, `/sys`, `/etc/hosts`, or
-`/etc/resolv.conf` setup; no bridge networking, port publishing, or loopback
-configuration (`none` is an isolated network namespace with `lo` down); no
+Known Linux backend gaps (all deliberate, not silent): no cgroups, capability
+dropping, seccomp, or LSM policy; no TTY, `/dev`, `/dev/pts`, `/sys`,
+`/etc/hosts`, or `/etc/resolv.conf` setup; no bridge networking, port
+publishing, or loopback configuration (`none` is an isolated network
+namespace with `lo` down); no
 user namespaces; no cgroup-based kill, so stop/delete relies on the helper's
 process group and a container process that creates a new session can escape
 it. The backend is not yet a security boundary.

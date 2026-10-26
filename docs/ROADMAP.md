@@ -69,7 +69,7 @@ name generation for unnamed creates, no negative (wait-forever) stop
 timeouts, and no real process execution — `SyntheticRuntime` is the only
 runtime implementation until E.
 
-## E — OCI runtime (`docker-runtime`) — **portable layer complete; Linux execution compile-checked**
+## E — OCI runtime (`docker-runtime`) — **complete; Linux execution verified on CI**
 Own OCI-bundle creation (runtime-spec 1.3.0 structures + schema
 validation of emitted JSON); execution via platform-appropriate process
 spawn; honest `Unsupported` for missing kernel features; attach/stdio
@@ -95,16 +95,16 @@ Implemented:
   blocked signal mask plus `signalfd` forwards signals, and `SIGCHLD`
   drives the reap. Safe `nix` APIs only (`unsafe_code = "forbid"`).
 
-Exit criterion remains partially unmet: a real process has not been
-executed because this host is Windows with no Linux kernel/WSL/VM. The
-Linux target is installed and the backend passes `cargo check` and
-`cargo clippy -D warnings`. A Linux runner must execute the helper before
-this milestone can be marked complete.
+Exit criterion met on `ubuntu-latest` CI: the runtime smoke test executes a
+real static process inside a materialized image rootfs, and the Engine API
+smoke test loads an OCI archive and runs a container through
+`docker-rsd --runtime oci`. This Windows host still cannot execute the helper
+(no Linux kernel/WSL/VM); local iteration relies on CI and its published
+check-run annotations.
 
-Known E limits: no rootfs extraction from the image store, cgroups,
-capability dropping, seccomp, LSM labels, user namespaces, TTY, additional
-mounts, hooks, devices, bridge networking, or custom rlimits. Each returns
-`Unsupported` rather than being ignored.
+Known E limits: no cgroups, capability dropping, seccomp, LSM labels, user
+namespaces, TTY, additional mounts, hooks, devices, bridge networking, or
+custom rlimits. Each returns `Unsupported` rather than being ignored.
 
 ## F/G — Engine HTTP API (`docker-api`) — **container + image slices runnable**
 Router + version middleware per `moby/api/common.go` gates; endpoints in
@@ -124,15 +124,17 @@ stdio (stdcopy framing, `follow`/`timestamps`/`tail`/`since`/`until` with
 Moby's error messages, relative Go durations, and lease-based follow EOF);
 Docker-cased DTOs with explicit
 rejection of unsupported fields; synchronous `tiny_http` transport; runnable
-`docker-rsd` binary over TCP with `--data-root`. Verified with curl-level
-integration tests, an in-process registry fixture, a live Docker Hub pull,
-and a manual Docker CLI v29.9.1 smoke test including save/load.
+`docker-rsd` binary over TCP with `--data-root` and a native
+`--runtime oci` backed by image-rootfs materialization. Verified with
+curl-level integration tests, an in-process registry fixture, a live Docker
+Hub pull, a manual Docker CLI v29.9.1 smoke test including save/load, and an
+`ubuntu-latest` smoke run that executes a real container through the Engine
+API and reads its output back from `/containers/{id}/logs`.
 
-Still pending: push/prune, image filters, attach/exec hijack,
-stats/top, network and volume endpoints, image-rootfs materialization, and
-native execution in the daemon binary. Container state is in-memory only;
-image metadata and blobs persist; captured logs stay in a bounded in-memory
-ring and are lost on daemon restart.
+Still pending: push/prune, image filters, attach/exec hijack, stats/top, and
+network and volume endpoints. Container state is in-memory only; image
+metadata and blobs persist; captured logs stay in a bounded in-memory ring
+and are lost on daemon restart.
 
 Exit criterion partially met: curl/Docker-CLI container lifecycle and image
 pull/list/inspect/tag/delete/save/load work over HTTP, the version-gate

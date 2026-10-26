@@ -7,13 +7,13 @@ Docker CLI, containerd, runc, and BuildKit with a modular Rust workspace
 that preserves compatibility with Docker Engine API semantics and the OCI
 specifications.
 
-**Project status: Milestones A—D complete; Milestone E portable OCI bundle
-layer complete, with the Linux execution backend compile-checked but not yet
-run on this Windows host; Milestone F/G has a runnable Docker-compatible
-container-lifecycle, image-management, and image-save/load HTTP API with real
-registry pulls and persistent image metadata, with native execution and
-rootfs materialization still pending — see
-[docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).**
+**Project status: Milestones A—E complete; the native Linux runtime executes
+real containers in materialized image rootfs on `ubuntu-latest` CI (this
+Windows host cannot run it locally); Milestone F/G has a runnable
+Docker-compatible container-lifecycle, image-management, image-save/load, and
+logs HTTP API with real registry pulls and persistent image metadata. Attach,
+exec, and container/log persistence across daemon restarts are still pending —
+see [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).**
 
 ## Motivation and scope
 
@@ -54,21 +54,23 @@ Current milestone map:
   threads; Moby restart-manager backoff and policy semantics; deferred
   replies; auto-remove; `create`/`start`/`kill`/`die`/`stop`/`restart`/
   `destroy` events; deterministic `SyntheticRuntime` for headless tests.
-* **E — OCI runtime** *(portable layer implemented; Linux execution
-  compile-checked)*: runtime-spec 1.3.0 types, model-to-bundle generation,
-  pinned-schema validation, shared runtime/task/stdio boundary, explicit
-  Windows `Unsupported`, and a Linux two-stage init helper. No real process
-  has been run on this Windows host.
-* **F/G — Engine HTTP API** *(container + image-management + archive slices
-  implemented; native execution pending)*: Docker API `1.24`–`1.51` gate,
+* **E — OCI runtime** *(complete; execution verified on Linux CI)*:
+  runtime-spec 1.3.0 types, model-to-bundle generation, pinned-schema
+  validation, shared runtime/task/stdio boundary, explicit Windows
+  `Unsupported`, and a Linux two-stage init helper. CI runs a real static
+  process through unshare/chroot/`/proc`/identity drop in a materialized
+  image rootfs.
+* **F/G — Engine HTTP API** *(container + image-management + archive + logs
+  slices implemented)*: Docker API `1.24`–`1.51` gate,
   `/_ping`, `/version`, `/info`, container create/list/inspect/start/stop/
   restart/kill/wait/delete, image list/pull/inspect/history/tag/delete,
   image save/load (`/images/get`, `/images/{name}/get`, `/images/load`),
-  streaming `/events` with replay, and a runnable `docker-rsd` binary with a
-  persistent image store. Real registry pulls (multi-platform manifests,
-  verified layers), Docker Hub, Docker save/load archives, and the real
-  Docker CLI v29.9.1 have been exercised. The wired runtime is synthetic:
-  lifecycle state and events are real, but host processes do not run yet.
+  streaming `/events` with replay, `/containers/{id}/logs`, and a runnable
+  `docker-rsd` binary with a persistent image store. Real registry pulls
+  (multi-platform manifests, verified layers), Docker Hub, Docker save/load
+  archives, and the real Docker CLI v29.9.1 have been exercised. It defaults
+  to the synthetic runtime; `--runtime oci` materializes image rootfs and
+  runs real containers (verified on `ubuntu-latest` CI).
 * **H/I — Builder**, **J — CLI**, **K — Security hardening**,
   **L — Conformance & differential**: planned. See `docs/ROADMAP.md`.
 
@@ -109,6 +111,13 @@ cargo check -p docker-runtime --target x86_64-unknown-linux-gnu  # Linux backend
 cargo run -p docker-rsd -- --host 127.0.0.1:2375 --data-root /var/lib/docker-rs
 ```
 
+On Linux, add `--runtime oci` (alias `native`) to execute real containers: the
+daemon materializes each image into `<data-root>/containers/<id>/rootfs` and
+runs the container through the built-in init helper. The native runtime
+requires root (rootless/user namespaces are not implemented yet) and a
+`docker-runtime-init` binary next to `docker-rsd`; `cargo build --workspace`
+produces both.
+
 `--data-root` (or `DRC_DATA_ROOT`) must name a writable absolute directory;
 the image index and content-addressed blobs live below it. On this Windows
 host the built-in default is `C:\ProgramData\docker-rs`, which normally needs
@@ -135,11 +144,13 @@ Pulls default to the daemon host platform (`windows/amd64` on this host), so
 Linux images need an explicit `--platform linux/amd64`; a missing platform is
 reported honestly instead of silently selecting another architecture.
 
-The current daemon uses the **synthetic runtime**. Container lifecycle state,
-the API, and events are real; no host process is executed, so `docker logs`
-and foreground `docker run` return an explicit unsupported error. Do not
-expose the unauthenticated listener to an untrusted network. The runnable
-surface and remaining gaps are listed in
+The daemon defaults to the **synthetic runtime**: container lifecycle state,
+the API, and events are real, but no host process is executed. On Linux,
+`--runtime oci` executes real containers and captures their stdout/stderr for
+`docker logs`; attach/exec, TTY, and bridge networking remain explicit
+`Unsupported`, so foreground `docker run` (which needs attach) is not
+available yet. Do not expose the unauthenticated listener to an untrusted
+network. The runnable surface and remaining gaps are listed in
 [docs/API_COMPATIBILITY.md](docs/API_COMPATIBILITY.md).
 
 ## Repository layout
@@ -175,12 +186,13 @@ upstream/             pinned original repositories (not tracked in git)
 * accomplishing Milestones A–D needs none beyond the toolchain (the registry
   client talks HTTP/1.1 + TLS over `std::net`; Milestone D is exercised with
   the in-process synthetic runtime and does not execute containers);
-* the F/G container API (`docker-rsd`) likewise needs only the toolchain and
-  a free TCP port; it serves the synthetic runtime;
+* the F/G container API (`docker-rsd`) needs only the toolchain and a free
+  TCP port; it defaults to the synthetic runtime and `--runtime oci` runs
+  real Linux containers;
 * Milestone E native execution requires a Linux host with namespaces, mount
   privileges, and root (rootless/user namespaces are not implemented yet).
-  The code is compile-checked for `x86_64-unknown-linux-gnu`, but this
-  Windows host has no Linux kernel/WSL/VM to run it.
+  It is verified on `ubuntu-latest` CI; this Windows host has no Linux
+  kernel/WSL/VM to run it locally.
 
 ## Security limitations
 

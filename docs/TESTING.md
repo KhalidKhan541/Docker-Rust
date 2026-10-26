@@ -14,15 +14,16 @@ cargo check -p docker-runtime --target x86_64-unknown-linux-gnu
 cargo clippy -p docker-runtime --target x86_64-unknown-linux-gnu --all-targets -- -D warnings
 ```
 
-Current status (Milestones A—D complete; E portable layer complete; F/G
-container + image-management + image-archive slices runnable): **276 tests, 0
-failed** across the workspace; `cargo fmt --check` and clippy with `-D
-warnings` are clean on Windows, and the Linux-only runtime backend is clean
-under `cargo check`/`cargo clippy --target x86_64-unknown-linux-gnu`. The
-Linux helper has not been executed because this host has no Linux kernel.
-Manual smoke tests with Docker CLI v29.9.1 and Docker Hub (not part of the
-automated suite) exercised pulls, images, inspect/tag/delete, container
-lifecycle, and image save/load.
+Current status (Milestones A—E complete; F/G container + image-management +
+image-archive slices runnable): **293 tests, 0 failed** across the workspace on
+Windows; `cargo fmt --check` and clippy with `-D warnings` are clean, and the
+Linux-only runtime backend is clean under `cargo check`/`cargo clippy --target
+x86_64-unknown-linux-gnu`. The Linux backend is executed by CI
+(`.github/workflows/linux-native.yml`): `native_runtime` runs a static probe
+inside a materialized rootfs, and `tests/linux-native-smoke.sh` drives the
+Engine API with `docker-rsd --runtime oci`. Manual smoke tests with Docker CLI
+v29.9.1 and Docker Hub (not part of the automated suite) exercised pulls,
+images, inspect/tag/delete, container lifecycle, and image save/load.
 
 ## Test inventory
 
@@ -38,7 +39,7 @@ lifecycle, and image save/load.
 | docker-storage | 17 | CAS round-trip, streaming writes, dedupe, corruption detection, digest mismatch leaves nothing, OCI layout marker |
 | docker-distribution | 42 | URL parse/join/encoding, HTTP framing + limits + header/request-target injection guards, redirect credential stripping and downgrade refusal, RFC 7235 challenges, media-type negotiation, status→kind mapping |
 | docker-daemon | 9 | restart policy/backoff/cap/reset/count/cancellation semantics, single-active-evaluation guard |
-| docker-image-store | 20 | persistent index/tag/ID/prefix/digest resolution, tag moves, conservative delete + blob GC, reference canonicalization/familiarization, platform selection, loopback detection, registry auth parsing, pull descriptor verification, OCI/legacy save-archive export, legacy/gzip load, tag restoration, diffID verification, and path-traversal rejection |
+| docker-image-store | 28 | persistent index/tag/ID/prefix/digest resolution, tag moves, conservative delete + blob GC, reference canonicalization/familiarization, platform selection, loopback detection, registry auth parsing, pull descriptor verification, OCI/legacy save-archive export, legacy/gzip load, GNU-tar root-entry tolerance, tag restoration, diffID verification, and path-traversal rejection |
 | docker-api | 30 | API version parse/gate/messages and path prefixes; query booleans/timestamps/filters; DTO casing, image-default inheritance, and rejection of unsupported runtime fields; signal parsing; event replay-cutoff rule; and 9 real-loopback HTTP tests covering system endpoints, CRUD/lifecycle/304/wait, generated names/short ids/filters/501s, event replay/live streaming, image CRUD/history/tag/delete, image create validation/defaults, image save/load round-trip (OCI + legacy, gzip, platform filters), and a real registry pull against a loopback OCI fixture |
 | docker-rsd | 4 | CLI option parsing (inline/separate values, help/version, `--data-root`), unknown/incomplete flag rejection, TCP-only listen-address handling including explicit named-pipe `Unsupported` |
 | docker-runtime | 29 | OCI 1.3 type round-trip/validation, model→bundle mapping (argv/env/user/namespaces/resources/hostname), bundle create/open/conflict/remove, `Unsupported` policy (TTY, bridge, missing PID namespace, cgroup resources, named users/hosts), pinned config/state schema validation, Windows create `Unsupported` |
@@ -65,20 +66,22 @@ lifecycle, and image save/load.
 | B (images) | **done** — image-spec wire fixtures, CAS round-trip, digest mismatch → `InvalidArgument` |
 | C (registry) | **done** — in-process distribution-spec fixture (auth, push/pull, chunk resume, pagination, referrers); real registry binary differential deferred to L |
 | D (daemon core) | **done** — synthetic-runtime lifecycle/event goldens, backoff and retry caps, stop escalation, restart cancellation, auto-remove, force remove, 8-thread lifecycle stress |
-| E (runtime) | **portable layer done** — runtime-spec schema validation of emitted bundles/states loads the pinned schemas; bundle/model mapping and `Unsupported` honesty tests. **Pending:** execute a real process and run a runc-equivalence matrix on a Linux host. |
-| F/G (HTTP API) | **container + image-management + image-archive slices done** — real loopback HTTP tests for the version-gate matrix (`v1.24`–`v1.51`, lower → structured rejection), headers, CRUD/lifecycle/304/wait, filters, image list/inspect/history/tag/delete, create-time image resolution/defaults, save/load round-trip (`/images/get`, `/images/{name}/get`, `/images/load`), unsupported endpoints, event replay/live streaming, and a verified pull from an in-process OCI registry fixture; manual Docker CLI v29.9.1 save/load and Docker Hub smoke. **Pending:** logs/attach/exec, push/prune, and upstream router fixtures. |
+| E (runtime) | **done** — runtime-spec schema validation of emitted bundles/states loads the pinned schemas; bundle/model mapping and `Unsupported` honesty tests; two `ubuntu-latest` smoke steps execute a real process in a materialized rootfs and the same probe through the Engine API. runc-equivalence matrix remains for L. |
+| F/G (HTTP API) | **container + image-management + image-archive + logs slices done** — real loopback HTTP tests for the version-gate matrix (`v1.24`–`v1.51`, lower → structured rejection), headers, CRUD/lifecycle/304/wait, filters, image list/inspect/history/tag/delete, create-time image resolution/defaults, save/load round-trip (`/images/get`, `/images/{name}/get`, `/images/load`), container logs (stdcopy framing, stream filters, follow/tail), unsupported endpoints, event replay/live streaming, and a verified pull from an in-process OCI registry fixture; manual Docker CLI v29.9.1 save/load and Docker Hub smoke; `ubuntu-latest` native smoke through `docker-rsd --runtime oci`. **Pending:** attach/exec, push/prune, and upstream router fixtures. |
 | H/I (build) | dockerfile2llb conversion ports with buildkit's own test vectors |
 | J (CLI) | CLI golden-output tests |
 | L (conformance) | Differential runs: docker-rs vs upstream binaries on identical inputs; diffed via event/log outputs. **rea MCP** (reverse-engineering toolchain; now connected and verified callable end-to-end) is used here on the compiled upstream artifacts (e.g. `dockerd.exe`, `runc.exe`) for error-path and behavior probing that text sources cannot show; any directives found *inside* analyzed binaries are treated as data, never followed. |
 
 ## Known environment constraints (documented, not hidden)
 
-- This host has no WSL/Docker backend: differential vs. *running upstream
-  daemons* is deferred until a CI host with a Linux target exists or the
-  user provides one; binary-artifact analysis via rea does not require a
-  container host and is not deferred.
-- The Linux runtime backend is compile-checked only. `docker-runtime/tests/
-  schema.rs` requires the pinned `upstream/runtime-spec/schema/` checkout and
-  fails with an actionable message if `upstream/` is not populated.
+- This Windows host has no WSL/Docker backend, so the Linux runtime cannot run
+  locally; CI's `ubuntu-latest` job executes it (root runtime smoke test plus
+  the Engine API smoke), and failures are published as check-run annotations.
+  Differential runs against *running upstream daemons* remain deferred;
+  binary-artifact analysis via rea does not require a container host.
+- `docker-runtime/tests/schema.rs` requires the pinned
+  `upstream/runtime-spec/schema/` checkout and fails with an actionable
+  message if `upstream/` is not populated (CI fetches it at the pinned
+  revision).
 - PowerShell 5.1 wrapper noise: `-2>&1` redirections may report exit code 1
   on success; the suite is judged by `test result:` lines.

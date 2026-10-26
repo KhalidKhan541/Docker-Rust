@@ -168,25 +168,27 @@ broker; the stream uses chunked transfer encoding.
   `Unsupported`/`Conflict` rather than pretending to work. Save/load are
   implemented but spooled to temporary files instead of streaming directly.
   Pull progress is buffered, not streamed per layer.
-- **Images own no extracted rootfs yet.** Pull verifies and stores the
-  manifest/config/layer blobs, but layers are not unpacked into a container
-  rootfs. Container create therefore cannot run the image even if the
-  native runtime were selected; `docker-rsd` still uses the synthetic
-  runtime.
+- **Image rootfs materialization lives in `docker-rsd`.** Pull verifies and
+  stores the manifest/config/layer blobs; `docker-rsd --runtime oci`
+  materializes them into `<data-root>/containers/<id>/rootfs` through
+  `ImageRootfsProvider` and executes the container. Library-level callers must
+  supply a rootfs or provider, and the default runtime remains synthetic.
 - **Image deletion does not check container use.** Container records do not
   yet track image references for GC, and the JSON index write is not atomic
   on Windows. Blob GC is deliberately conservative.
-- **No process execution in the daemon binary.** `docker-rsd` wires the
-  synthetic runtime: lifecycle transitions and events are real, host PIDs are
-  zero, and no container process runs. The OCI backend exists and is
-  compile-checked but has no image-rootfs provider connected.
+- **The daemon defaults to the synthetic runtime.** `docker-rsd` serves the
+  synthetic runtime unless `--runtime oci` (alias `native`) is passed; that
+  mode materializes image rootfs and runs real Linux containers. Synthetic
+  lifecycle transitions and events are real, but host PIDs are zero and no
+  container process runs.
 - **No network plumbing.** `bridge`/`default` is accepted as the default
   metadata value, `host` and `none` are accepted, but no bridge, veth, DNS,
   port publishing, or named/container network setup occurs. Named and
   `container:` network modes are rejected at create.
-- **No logs/attach/exec/stats/top/changes/export/archive/pause/update/rename/
+- **No attach/exec/stats/top/changes/export/archive/pause/update/rename/
   resize.** Container subresources not listed above return HTTP 501 with a
-  `not implemented` message.
+  `not implemented` message. `/containers/{id}/logs` is implemented over
+  captured stdio but is memory-only.
 - **No persistence.** Container records live only in the daemon actor's
   memory; restarting `docker-rsd` loses them.
 - **Transport is TCP only.** `npipe://` and `unix://` listeners are rejected

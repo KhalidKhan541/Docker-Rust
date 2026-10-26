@@ -90,7 +90,7 @@ Component responsibilities, as seen from the sources:
 | Container model/store      | `docker-container-model`                | `moby/container/{state,memory_store,container}.go`   |
 | Daemon lifecycle actor     | `docker-daemon`                         | `moby/daemon/{monitor,start,stop,kill,delete,events}.go`, `restartmanager/restartmanager.go` |
 | Image/content store        | `docker-image`, `docker-storage`         | image-spec v1.1.1 types; containerd `core/content`-style CAS        |
-| (next) Exec/runtime        | `docker-runtime` (portable layer; Linux compile-checked) | runc `libcontainer` (OCI runtime)                    |
+| Exec/runtime               | `docker-runtime` (OCI bundle + Linux init helper, CI-verified) | runc `libcontainer` (OCI runtime)                    |
 | (next) HTTP API            | planned `docker-api`                    | `moby/api/server`, `api/common.go` version gates     |
 | (next) Builder             | planned `docker-buildkit`               | buildkit `frontend/dockerfile/dockerfile2llb`        |
 | Registry client            | `docker-distribution`                   | distribution-spec v1.1.1 client (pull/push/auth)     |
