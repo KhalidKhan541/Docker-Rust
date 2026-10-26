@@ -15,15 +15,29 @@ cargo clippy -p docker-runtime --target x86_64-unknown-linux-gnu --all-targets -
 ```
 
 Current status (Milestones A—E complete; F/G container + image-management +
-image-archive slices runnable): **293 tests, 0 failed** across the workspace on
-Windows; `cargo fmt --check` and clippy with `-D warnings` are clean, and the
-Linux-only runtime backend is clean under `cargo check`/`cargo clippy --target
-x86_64-unknown-linux-gnu`. The Linux backend is executed by CI
-(`.github/workflows/linux-native.yml`): `native_runtime` runs a static probe
-inside a materialized rootfs, and `tests/linux-native-smoke.sh` drives the
-Engine API with `docker-rsd --runtime oci`. Manual smoke tests with Docker CLI
-v29.9.1 and Docker Hub (not part of the automated suite) exercised pulls,
-images, inspect/tag/delete, container lifecycle, and image save/load.
+image-archive + logs + persistence slices runnable): **309 tests, 0 failed**
+across the workspace on Windows; `cargo fmt --check` and clippy with
+`-D warnings` are clean, and the Linux-only runtime backend is clean under
+`cargo check`/`cargo clippy --target x86_64-unknown-linux-gnu`. The Linux
+backend is executed by CI (`.github/workflows/linux-native.yml`):
+`native_runtime` runs a static probe inside a materialized rootfs, and
+`tests/linux-native-smoke.sh` drives the Engine API with
+`docker-rsd --runtime oci`. The smoke test then starts a long-running
+container as uid/gid 1000, SIGKILLs the daemon, asserts the container process
+is gone (parent-death signal re-armed after the credential change), restarts
+on the same data root, and verifies the exited record and replayed logs.
+Manual smoke tests with Docker CLI v29.9.1 and Docker Hub (not part of the
+automated suite) exercised pulls, images, inspect/tag/delete, container
+lifecycle, and image save/load.
+
+Daemon persistence is covered by unit and integration tests: container
+records round-trip through `container.json` and survive a spawn/shutdown/spawn
+cycle; lost running containers recover as exited (255); restart-policy
+containers start again; captured log chunks round-trip base64 JSONL
+(including non-UTF-8 bytes), replay into a bounded ring, ignore a torn
+trailing record, and are deleted with the container directory. The Linux
+smoke test additionally proves that a daemon SIGKILL tears down the running
+container's PID namespace (parent-death signal) before recovery.
 
 ## Test inventory
 
@@ -38,7 +52,7 @@ images, inspect/tag/delete, container lifecycle, and image save/load.
 | docker-image | 17 | descriptor/manifest/index/config wire casing against `image-spec`, validation rules, empty-JSON descriptor hash |
 | docker-storage | 17 | CAS round-trip, streaming writes, dedupe, corruption detection, digest mismatch leaves nothing, OCI layout marker |
 | docker-distribution | 42 | URL parse/join/encoding, HTTP framing + limits + header/request-target injection guards, redirect credential stripping and downgrade refusal, RFC 7235 challenges, media-type negotiation, status→kind mapping |
-| docker-daemon | 9 | restart policy/backoff/cap/reset/count/cancellation semantics, single-active-evaluation guard |
+| docker-daemon | 25 | 21 unit: restart policy/backoff/cap/reset/count/cancellation semantics and single-active-evaluation guard (9), versioned record round-trip/atomic replace/corrupt and ID-mismatch rejection/lost-running recovery (6), log file round-trip incl. non-UTF-8, bounded replay, torn-line tolerance, close/reopen (6); 4 persistence integration tests: record and log survival across spawn/shutdown/spawn, directory removal, exited-255 recovery, and restart-policy restart |
 | docker-image-store | 28 | persistent index/tag/ID/prefix/digest resolution, tag moves, conservative delete + blob GC, reference canonicalization/familiarization, platform selection, loopback detection, registry auth parsing, pull descriptor verification, OCI/legacy save-archive export, legacy/gzip load, GNU-tar root-entry tolerance, tag restoration, diffID verification, and path-traversal rejection |
 | docker-api | 30 | API version parse/gate/messages and path prefixes; query booleans/timestamps/filters; DTO casing, image-default inheritance, and rejection of unsupported runtime fields; signal parsing; event replay-cutoff rule; and 9 real-loopback HTTP tests covering system endpoints, CRUD/lifecycle/304/wait, generated names/short ids/filters/501s, event replay/live streaming, image CRUD/history/tag/delete, image create validation/defaults, image save/load round-trip (OCI + legacy, gzip, platform filters), and a real registry pull against a loopback OCI fixture |
 | docker-rsd | 4 | CLI option parsing (inline/separate values, help/version, `--data-root`), unknown/incomplete flag rejection, TCP-only listen-address handling including explicit named-pipe `Unsupported` |

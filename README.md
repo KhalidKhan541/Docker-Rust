@@ -11,9 +11,10 @@ specifications.
 real containers in materialized image rootfs on `ubuntu-latest` CI (this
 Windows host cannot run it locally); Milestone F/G has a runnable
 Docker-compatible container-lifecycle, image-management, image-save/load, and
-logs HTTP API with real registry pulls and persistent image metadata. Attach,
-exec, and container/log persistence across daemon restarts are still pending —
-see [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).**
+logs HTTP API with real registry pulls, persistent image metadata, and
+container records/logs that survive daemon restarts. Attach, exec, and process
+re-attachment across a daemon restart are still pending — see
+[docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).**
 
 ## Motivation and scope
 
@@ -53,24 +54,29 @@ Current milestone map:
   actor; create/start/stop/kill/restart/remove lifecycle; per-task monitor
   threads; Moby restart-manager backoff and policy semantics; deferred
   replies; auto-remove; `create`/`start`/`kill`/`die`/`stop`/`restart`/
-  `destroy` events; deterministic `SyntheticRuntime` for headless tests.
+  `destroy` events; deterministic `SyntheticRuntime` for headless tests;
+  versioned container records and append-only log files with restart recovery.
 * **E — OCI runtime** *(complete; execution verified on Linux CI)*:
   runtime-spec 1.3.0 types, model-to-bundle generation, pinned-schema
   validation, shared runtime/task/stdio boundary, explicit Windows
-  `Unsupported`, and a Linux two-stage init helper. CI runs a real static
+  `Unsupported`, and a Linux two-stage init helper (both stages tied to the
+  daemon's lifetime with a parent-death signal). CI runs a real static
   process through unshare/chroot/`/proc`/identity drop in a materialized
   image rootfs.
-* **F/G — Engine HTTP API** *(container + image-management + archive + logs
-  slices implemented)*: Docker API `1.24`–`1.51` gate,
+* **F/G — Engine HTTP API** *(container + image-management + archive + logs +
+  persistence slices implemented)*: Docker API `1.24`–`1.51` gate,
   `/_ping`, `/version`, `/info`, container create/list/inspect/start/stop/
   restart/kill/wait/delete, image list/pull/inspect/history/tag/delete,
   image save/load (`/images/get`, `/images/{name}/get`, `/images/load`),
   streaming `/events` with replay, `/containers/{id}/logs`, and a runnable
-  `docker-rsd` binary with a persistent image store. Real registry pulls
-  (multi-platform manifests, verified layers), Docker Hub, Docker save/load
-  archives, and the real Docker CLI v29.9.1 have been exercised. It defaults
+  `docker-rsd` binary with a persistent image and container-record/log store.
+  Real registry pulls (multi-platform manifests, verified layers), Docker Hub,
+  Docker save/load archives, and the real Docker CLI v29.9.1 have been
+  exercised. It defaults
   to the synthetic runtime; `--runtime oci` materializes image rootfs and
-  runs real containers (verified on `ubuntu-latest` CI).
+  runs real containers (verified on `ubuntu-latest` CI). Container records,
+  logs, and restart policies survive a daemon restart; a lost process is
+  reported exited (255) and only restarted when its policy says so.
 * **H/I — Builder**, **J — CLI**, **K — Security hardening**,
   **L — Conformance & differential**: planned. See `docs/ROADMAP.md`.
 
@@ -118,10 +124,12 @@ requires root (rootless/user namespaces are not implemented yet) and a
 `docker-runtime-init` binary next to `docker-rsd`; `cargo build --workspace`
 produces both.
 
-`--data-root` (or `DRC_DATA_ROOT`) must name a writable absolute directory;
-the image index and content-addressed blobs live below it. On this Windows
-host the built-in default is `C:\ProgramData\docker-rs`, which normally needs
-administrator rights, so pass a user-writable path for development.
+`--data-root` (or `DRC_DATA_ROOT`) selects the persistent image and container
+root: image metadata/blobs under `images/`, and one directory per container
+under `containers/<id>/` holding `container.json`, `logs.jsonl`, and (for the
+native runtime) `rootfs/`. On this Windows host the built-in default is
+`C:\ProgramData\docker-rs`, which normally needs administrator rights, so pass
+a user-writable path for development.
 
 In another terminal, point the official Docker CLI at the daemon:
 
@@ -149,8 +157,13 @@ the API, and events are real, but no host process is executed. On Linux,
 `--runtime oci` executes real containers and captures their stdout/stderr for
 `docker logs`; attach/exec, TTY, and bridge networking remain explicit
 `Unsupported`, so foreground `docker run` (which needs attach) is not
-available yet. Do not expose the unauthenticated listener to an untrusted
-network. The runnable surface and remaining gaps are listed in
+available yet. Container records and logs survive a daemon restart. A process
+that was running when the daemon stopped cannot be adopted, so it is reported
+exited with code 255; the helper dies with the daemon (taking its PID namespace
+with it), and containers with `--restart always`, `unless-stopped`, or
+`on-failure` are started again with a fresh process. Do not expose the
+unauthenticated listener to an untrusted network. The runnable surface and
+remaining gaps are listed in
 [docs/API_COMPATIBILITY.md](docs/API_COMPATIBILITY.md).
 
 ## Repository layout
@@ -170,7 +183,7 @@ crates/
   runtime/            OCI 1.3 spec types, bundle builder, runtime/task boundary,
                       Linux two-stage init, non-Linux Unsupported backend
   daemon/             single-owner lifecycle actor, restart manager, runtime
-                      boundary, deterministic synthetic runtime
+                      boundary, persisted records/logs, synthetic runtime
   image-store/        persistent image index + verified-CAS blobs + registry pulls
                       + Docker/OCI save-load archives
   api/                Docker Engine HTTP API (version gate, DTOs, routes, events)

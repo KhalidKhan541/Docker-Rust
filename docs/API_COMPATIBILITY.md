@@ -187,10 +187,19 @@ broker; the stream uses chunked transfer encoding.
   `container:` network modes are rejected at create.
 - **No attach/exec/stats/top/changes/export/archive/pause/update/rename/
   resize.** Container subresources not listed above return HTTP 501 with a
-  `not implemented` message. `/containers/{id}/logs` is implemented over
-  captured stdio but is memory-only.
-- **No persistence.** Container records live only in the daemon actor's
-  memory; restarting `docker-rsd` loses them.
+  `not implemented` message. `/containers/{id}/logs` is implemented over the
+  persisted capture store.
+- **Persistence is partial.** Container records (config, host config, state),
+  restart policies, and captured logs are stored under
+  `<data-root>/containers/<id>/` and restored at daemon startup. A container
+  that was running when the daemon stopped cannot be adopted, so it is
+  reported exited with code 255; `always`, `unless-stopped`, and `on-failure`
+  policies start a fresh process, while `no` leaves it exited. Restart counts
+  and the manually-stopped flag reset on recovery. The log file is unbounded
+  and only the newest records that fit the 4 MiB serving ring are replayed.
+  The native init helper arms a parent-death SIGKILL, so an abruptly killed
+  daemon also kills the helper and its container PID namespace; recovery does
+  not leave a live process behind a record that says `exited`.
 - **Transport is TCP only.** `npipe://` and `unix://` listeners are rejected
   explicitly by `docker-rsd`. Clients connect with
   `DOCKER_HOST=tcp://127.0.0.1:2375`.

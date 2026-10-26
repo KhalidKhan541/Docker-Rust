@@ -93,7 +93,9 @@ Implemented:
   identity/`no_new_privs`, and `exec`s the process. Stage 1 stays
   single-threaded (a thread cannot join an unshared PID namespace): a
   blocked signal mask plus `signalfd` forwards signals, and `SIGCHLD`
-  drives the reap. Safe `nix` APIs only (`unsafe_code = "forbid"`).
+  drives the reap. Both stages arm `PR_SET_PDEATHSIG(SIGKILL)`, so a daemon
+  crash kills the helper and the container PID namespace rather than
+  orphaning it. Safe `nix` APIs only (`unsafe_code = "forbid"`).
 
 Exit criterion met on `ubuntu-latest` CI: the runtime smoke test executes a
 real static process inside a materialized image rootfs, and the Engine API
@@ -132,9 +134,13 @@ Hub pull, a manual Docker CLI v29.9.1 smoke test including save/load, and an
 API and reads its output back from `/containers/{id}/logs`.
 
 Still pending: push/prune, image filters, attach/exec hijack, stats/top, and
-network and volume endpoints. Container state is in-memory only; image
-metadata and blobs persist; captured logs stay in a bounded in-memory ring
-and are lost on daemon restart.
+network and volume endpoints. Image metadata and blobs persist; container
+records, restart policies, and captured logs now persist under
+`<data-root>/containers/<id>/` and are restored at startup. A process that was
+running when the daemon stopped cannot be adopted, so it is reported exited
+(255) and restarted fresh only when its restart policy says so; the helper is
+tied to the daemon, so a crash tears down its PID namespace. Captured logs
+replay the newest 4 MiB into the serving ring.
 
 Exit criterion partially met: curl/Docker-CLI container lifecycle and image
 pull/list/inspect/tag/delete/save/load work over HTTP, the version-gate

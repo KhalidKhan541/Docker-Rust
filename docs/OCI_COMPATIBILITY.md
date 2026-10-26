@@ -57,8 +57,11 @@ Execution status: the Windows host returns `Unsupported`. The Linux backend
 is verified on `ubuntu-latest` CI: a static probe runs through unshare,
 chroot, procfs mounted after entering the PID namespace, and the identity
 drop, and the Engine API smoke runs the same probe through
-`docker-rsd --runtime oci`. See `IMPLEMENTATION_STATUS.md` for the explicit E
-gaps.
+`docker-rsd --runtime oci`. Both helper stages arm a parent-death SIGKILL
+(stage 2 re-arms it after dropping to the container user, which clears it), so
+killing the daemon tears down a running container's PID namespace instead of
+orphaning it; the smoke test asserts this. See `IMPLEMENTATION_STATUS.md` for
+the explicit E gaps.
 
 Known Linux backend gaps (all deliberate, not silent): no cgroups, capability
 dropping, seccomp, or LSM policy; no TTY, `/dev`, `/dev/pts`, `/sys`,
