@@ -9,11 +9,16 @@
 //! * [`restart`] ports Moby's restart manager backoff/count rules.
 //! * [`synthetic`] is a deterministic runtime for headless lifecycle tests.
 //!
+//! With `Daemon::spawn_persistent`, container records are written under
+//! `<data-root>/containers/<id>/container.json` and restored at startup;
+//! `Daemon::spawn` keeps the original ephemeral, in-memory behavior.
+//!
 //! Milestone F/G exposes this actor over the Engine HTTP API; Milestone E
 //! supplies the real OCI runtime implementation.
 
 pub mod engine;
 pub mod logs;
+mod persist;
 pub mod restart;
 pub mod runtime;
 pub mod synthetic;

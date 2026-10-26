@@ -10,12 +10,17 @@ use std::collections::HashMap;
 
 use docker_common::{ContainerId, Digest};
 use docker_errors::{Error, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::config::{ContainerConfig, HostConfig};
 use crate::state::StateSnapshot;
 
 /// One tracked container: identity + configs + observed state.
-#[derive(Debug, Clone)]
+///
+/// The record is the unit of on-disk persistence: the daemon serializes it
+/// verbatim so a restart restores exactly the configuration the container was
+/// created with.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerRecord {
     pub id: ContainerId,
     pub name: Option<String>,

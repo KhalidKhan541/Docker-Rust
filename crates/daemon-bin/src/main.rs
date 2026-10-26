@@ -1,10 +1,11 @@
 //! `docker-rsd`: the runnable Engine API daemon.
 //!
 //! This binary is deliberately thin: it resolves configuration, constructs a
-//! runtime and the single-owner daemon actor, and serves the HTTP API. The
-//! current build wires the deterministic synthetic runtime; the native OCI
-//! backend still requires a rootfs materializer that is not connected yet, so
-//! selecting it is rejected rather than silently substituted.
+//! runtime and the single-owner daemon actor, and serves the HTTP API.
+//! `--runtime synthetic` (default) serves the deterministic in-process runtime;
+//! `--runtime oci` executes real Linux containers, with image layers
+//! materialized under `<data-root>/containers/<id>/rootfs`. Container records
+//! are persisted in the same per-container directory and restored on restart.
 //!
 //! Start it with:
 //!
@@ -146,7 +147,11 @@ fn run() -> Result<()> {
 
     let listen = parse_listen_address(&config.api_host)?;
     let broker = Arc::new(EventBroker::new());
-    let daemon = Arc::new(Daemon::spawn(runtime, Arc::clone(&broker))?);
+    let daemon = Arc::new(Daemon::spawn_persistent(
+        runtime,
+        Arc::clone(&broker),
+        &config.data_root,
+    )?);
     let server_config = ServerConfig {
         runtime_name: runtime_name.clone(),
         runtime_path,
@@ -162,13 +167,17 @@ fn run() -> Result<()> {
     println!("docker-rsd listening on http://{}", server.addr());
     println!("client: DOCKER_HOST=tcp://{} docker version", server.addr());
     println!("image store: {}", images.root().display());
+    println!(
+        "container store: {}",
+        config.data_root.join("containers").display()
+    );
     if synthetic {
         println!(
             "warning: synthetic runtime is active; container lifecycle is real, but no host process is executed"
         );
     } else {
         println!(
-            "warning: native OCI runtime is experimental; bridge networking, cgroups, logs, and rootless mode are not implemented"
+            "warning: native OCI runtime is experimental; bridge networking, cgroups, TTY/attach/exec, and rootless mode are not implemented"
         );
     }
 

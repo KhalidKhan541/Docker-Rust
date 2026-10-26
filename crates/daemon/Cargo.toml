@@ -15,4 +15,8 @@ docker-events = { workspace = true }
 docker-container-model = { workspace = true }
 docker-runtime = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -230,6 +230,8 @@ dependencies = [
  "docker-events",
  "docker-runtime",
  "serde",
+ "serde_json",
+ "tempfile",
  "tracing",
 ]
 

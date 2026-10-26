@@ -14,6 +14,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::io::Read;
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -28,6 +29,7 @@ use docker_events::{event_now, Actor, EventAction, EventBroker, EventType, Known
 use serde::Serialize;
 
 use crate::logs::{LogStore, Stream, DEFAULT_LOG_CAPACITY};
+use crate::persist::ContainerDir;
 use crate::restart::RestartManager;
 use crate::runtime::{ExitStatus, Runtime, RuntimeConfig, RuntimeTask};
 
@@ -119,15 +121,41 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// Spawn the actor. The returned handle is cheap to clone only through
-    /// `Arc<Daemon>`; commands are serialized by the actor.
+    /// Spawn the actor with an ephemeral in-memory container store.
+    ///
+    /// The returned handle is cheap to clone only through `Arc<Daemon>`;
+    /// commands are serialized by the actor.
     pub fn spawn(runtime: Arc<dyn Runtime>, broker: Arc<EventBroker>) -> Result<Self> {
+        Self::spawn_inner(runtime, broker, None, Vec::new())
+    }
+
+    /// Spawn the actor with container records persisted under
+    /// `<data_root>/containers/<id>/`.
+    ///
+    /// Records that were running when the previous daemon stopped are restored
+    /// as exited (exit code 255) because their processes cannot be adopted.
+    pub fn spawn_persistent(
+        runtime: Arc<dyn Runtime>,
+        broker: Arc<EventBroker>,
+        data_root: impl AsRef<Path>,
+    ) -> Result<Self> {
+        let dir = ContainerDir::open(data_root.as_ref())?;
+        let records = dir.restore()?;
+        Self::spawn_inner(runtime, broker, Some(dir), records)
+    }
+
+    fn spawn_inner(
+        runtime: Arc<dyn Runtime>,
+        broker: Arc<EventBroker>,
+        container_dir: Option<ContainerDir>,
+        records: Vec<ContainerRecord>,
+    ) -> Result<Self> {
         let (tx, rx) = mpsc::channel();
         let engine_tx = tx.clone();
         let worker = thread::Builder::new()
             .name("docker-daemon".into())
             .spawn(move || {
-                Engine::new(runtime, broker, engine_tx).run(rx);
+                Engine::new(runtime, broker, engine_tx, container_dir, records).run(rx);
             })
             .map_err(|e| Error::internal(format!("cannot spawn daemon actor: {e}")))?;
         Ok(Self {
@@ -362,6 +390,8 @@ struct Engine {
     runtime: Arc<dyn Runtime>,
     broker: Arc<EventBroker>,
     command_tx: Sender<Command>,
+    /// `None` for an ephemeral daemon (tests and in-process callers).
+    container_dir: Option<ContainerDir>,
     shutting_down: bool,
     next_generation: u64,
 }
@@ -371,16 +401,33 @@ impl Engine {
         runtime: Arc<dyn Runtime>,
         broker: Arc<EventBroker>,
         command_tx: Sender<Command>,
+        container_dir: Option<ContainerDir>,
+        records: Vec<ContainerRecord>,
     ) -> Self {
+        let mut store = ContainerStore::new();
+        let mut meta = HashMap::new();
+        for record in records {
+            let id = record.id.clone();
+            if let Err(error) = store.put(record.clone()) {
+                tracing::error!(
+                    container = %id.as_str(),
+                    error = %error,
+                    "ignoring duplicate persisted container record"
+                );
+                continue;
+            }
+            meta.insert(id, Meta::new(&record.host_config));
+        }
         Self {
-            store: ContainerStore::new(),
-            meta: HashMap::new(),
+            store,
+            meta,
             tasks: HashMap::new(),
             pending_stops: HashMap::new(),
             pending_restarts: HashMap::new(),
             runtime,
             broker,
             command_tx,
+            container_dir,
             shutting_down: false,
             next_generation: 0,
         }
@@ -501,11 +548,14 @@ impl Engine {
             host_config: request.host_config,
             state: StateSnapshot::created(),
         };
-        let view = ContainerView::from_record(&record, 0);
         self.store.put(record.clone())?;
+        if let Err(error) = self.persist_record(&record) {
+            let _ = self.store.remove(&id);
+            return Err(error);
+        }
         self.meta.insert(id, Meta::new(&record.host_config));
         self.emit_container(&record, KnownAction::Create, &[]);
-        Ok(view)
+        Ok(ContainerView::from_record(&record, 0))
     }
 
     fn start(&mut self, reference: &str) -> Result<()> {
@@ -1285,16 +1335,25 @@ impl Engine {
             .min()
     }
 
+    fn persist_record(&self, record: &ContainerRecord) -> Result<()> {
+        match &self.container_dir {
+            Some(dir) => dir.save(record),
+            None => Ok(()),
+        }
+    }
+
     fn set_running(&mut self, id: &ContainerId) -> Result<()> {
-        let record = self.store.get_mut(id)?;
-        validate_transition(record.state.status, LifecycleState::Running)?;
-        record.state = StateSnapshot {
+        let mut updated = self.store.get(id)?.clone();
+        validate_transition(updated.state.status, LifecycleState::Running)?;
+        updated.state = StateSnapshot {
             status: LifecycleState::Running,
             exit_code: None,
             error_signal: None,
             started_at: Some(unix_now()),
             finished_at: None,
         };
+        self.persist_record(&updated)?;
+        self.store.get_mut(id)?.state = updated.state;
         Ok(())
     }
 
@@ -1304,32 +1363,41 @@ impl Engine {
         status: LifecycleState,
         exit: &ExitStatus,
     ) -> Result<()> {
-        let record = self.store.get_mut(id)?;
-        validate_transition(record.state.status, status)?;
-        record.state.status = status;
-        record.state.exit_code = Some(exit.exit_code);
-        record.state.error_signal = exit.signal.map(|signal| signal.as_str().to_string());
-        record.state.finished_at = Some(unix_now());
+        let mut updated = self.store.get(id)?.clone();
+        validate_transition(updated.state.status, status)?;
+        updated.state.status = status;
+        updated.state.exit_code = Some(exit.exit_code);
+        updated.state.error_signal = exit.signal.map(|signal| signal.as_str().to_string());
+        updated.state.finished_at = Some(unix_now());
+        self.persist_record(&updated)?;
+        self.store.get_mut(id)?.state = updated.state;
         Ok(())
     }
 
     fn set_dead(&mut self, id: &ContainerId, exit: &ExitStatus) -> Result<()> {
-        let record = self.store.get_mut(id)?;
-        validate_transition(record.state.status, LifecycleState::Dead)?;
-        let started_at = record.state.started_at;
-        record.state = StateSnapshot {
+        let mut updated = self.store.get(id)?.clone();
+        validate_transition(updated.state.status, LifecycleState::Dead)?;
+        updated.state = StateSnapshot {
             status: LifecycleState::Dead,
             exit_code: Some(exit.exit_code),
             error_signal: exit.signal.map(|signal| signal.as_str().to_string()),
-            started_at,
+            started_at: updated.state.started_at,
             finished_at: Some(unix_now()),
         };
+        self.persist_record(&updated)?;
+        self.store.get_mut(id)?.state = updated.state;
         Ok(())
     }
 
     fn remove_record(&mut self, id: &ContainerId) -> Result<()> {
         let record = self.store.get(id)?.clone();
         self.runtime.cleanup(id)?;
+        // Remove the on-disk record before dropping the in-memory one: if the
+        // directory cannot be removed, the container stays addressable instead
+        // of reappearing after the next daemon start.
+        if let Some(dir) = &self.container_dir {
+            dir.remove(id)?;
+        }
         // Force-close the log store so any follower stream ends even if a
         // capture thread is still draining a lingering pipe.
         if let Some(meta) = self.meta.get(id) {
