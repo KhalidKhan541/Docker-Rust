@@ -31,6 +31,8 @@ cleanup() {
     rm -rf "$WORK"
 }
 trap cleanup EXIT
+# Report the failing line so a bare curl status can be tied to a request.
+trap 'status=$?; echo "linux-native-smoke: failed at line $LINENO (status $status)" >&2' ERR
 
 cat >"$WORK/probe.S" <<'EOF'
 .global _start
@@ -100,14 +102,14 @@ for _ in $(seq 1 100); do
 done
 curl -fsS "http://127.0.0.1:$PORT/_ping" >/dev/null
 
-curl -fsS -X POST -H 'Content-Type: application/x-tar' --data-binary @"$WORK/image.tar" \
+curl -sS --fail-with-body -X POST -H 'Content-Type: application/x-tar' --data-binary @"$WORK/image.tar" \
     "http://127.0.0.1:$PORT/images/load" >/dev/null
 
-curl -fsS -X POST -H 'Content-Type: application/json' \
+curl -sS --fail-with-body -X POST -H 'Content-Type: application/json' \
     -d '{"Image":"probe:latest","HostConfig":{"NetworkMode":"none"}}' \
     "http://127.0.0.1:$PORT/containers/create?name=probe" >/dev/null
 
-curl -fsS -X POST -H 'Content-Type: application/json' -d '{}' \
+curl -sS --fail-with-body -X POST -H 'Content-Type: application/json' -d '{}' \
     "http://127.0.0.1:$PORT/containers/probe/start" >/dev/null
 
 state=created
@@ -119,7 +121,7 @@ for _ in $(seq 1 100); do
     sleep 0.1
 done
 
-inspect=$(curl -fsS "http://127.0.0.1:$PORT/containers/probe/json")
+inspect=$(curl -sS --fail-with-body "http://127.0.0.1:$PORT/containers/probe/json")
 echo "$inspect" | jq '{Name, State, Image}'
 exit_code=$(echo "$inspect" | jq -r '.State.ExitCode')
 if [ "$exit_code" != "0" ]; then
