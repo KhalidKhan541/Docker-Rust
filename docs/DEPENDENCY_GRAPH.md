@@ -3,7 +3,7 @@
 ## Rust workspace (current)
 
 Milestones A–E; the graph is acyclic and leaves target-specific code
-(`getrandom`, `std::net`, `std::process`, Linux `nix`/`signal-hook`) in
+(`getrandom`, `std::net`, `std::process`, Linux `nix`) in
 `docker-common`, `docker-distribution`, `docker-runtime`, and the daemon
 runtime boundary.
 
@@ -43,8 +43,8 @@ serde_json (features `derive`), chrono (RFC 3339 image-config and logging
 timestamps), tracing + tracing-subscriber (feature `local-time`),
 `getrandom 0.2` (IDs), `base64 0.22` (descriptor `data` codec mirroring Go
 `encoding/json`), `sha2 0.10` (content addressing), `native-tls 0.2`
-(SChannel on Windows, OpenSSL on Linux), and Linux-only `nix 0.30` +
-`signal-hook 0.3` for the OCI init helper. `regex 1` is a test-only dependency
+(SChannel on Windows, OpenSSL on Linux), and Linux-only `nix 0.30` for the
+OCI init helper. `regex 1` is a test-only dependency
 for the pinned JSON-schema validator.
 
 ## Upstream (Go) dependency shape — abridged, verified layouts

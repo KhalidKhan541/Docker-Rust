@@ -90,8 +90,10 @@ Implemented:
   `Unsupported`.
 - Linux-only two-stage init helper: stage 1 creates namespaces/rootfs bind;
   stage 2 is PID 1, mounts `/proc` in the correct PID namespace, applies
-  identity/`no_new_privs`, and `exec`s the process. Uses safe `nix` and
-  `signal-hook` APIs (`unsafe_code = "forbid"`).
+  identity/`no_new_privs`, and `exec`s the process. Stage 1 stays
+  single-threaded (a thread cannot join an unshared PID namespace): a
+  blocked signal mask plus `signalfd` forwards signals, and `SIGCHLD`
+  drives the reap. Safe `nix` APIs only (`unsafe_code = "forbid"`).
 
 Exit criterion remains partially unmet: a real process has not been
 executed because this host is Windows with no Linux kernel/WSL/VM. The

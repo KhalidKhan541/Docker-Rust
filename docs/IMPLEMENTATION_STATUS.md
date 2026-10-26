@@ -71,18 +71,21 @@ execution parameters.
 | Crate | Contents |
 |-------|----------|
 | `docker-runtime` | `spec.rs`: OCI runtime-spec 1.3.0 `Spec`/`Process`/`Root`/`Mount`/`Linux`/resource/state types with camelCase tags matching `specs-go`, omit-empty behavior, strict unknown-field rejection, and semantic checks (absolute container `cwd`, absolute mount destinations, unique namespaces, valid env entries, rlimit ordering; execution additionally requires mount, PID, IPC, and UTS namespaces and rejects `domainname`). `bundle.rs`: `spec_from_container` maps the Milestone D model to a schema-valid `config.json` — effective argv, Moby PATH/HOSTNAME/TERM environment merge, numeric UID[:GID], working dir, hostname (short ID default), mount/pid/ipc/uts (+ network unless host mode) namespaces, canonical rootfs path/read-only flag, memory/CPU/pids resources, image/network annotations; named/container networking, `extra_hosts`, and non-numeric users return `Unsupported`. `Bundle::create/open/write_config/remove` materializes and round-trips a bundle without overwriting an existing directory. `task.rs`: `Runtime`/`RuntimeTask`/`RuntimeConfig` (now with optional rootfs), `ExitStatus`, and optional stdio handles moved out of `docker-daemon` so the OCI and synthetic runtimes share one boundary. `oci/mod.rs`: `OciRuntime`, feature policy (`ensure_supported`) that rejects every unimplemented security-relevant field explicitly, and init-helper discovery (`DOCKER_RS_RUNTIME_INIT` override). `oci/unsupported.rs`: non-Linux hosts return an actionable `Unsupported`. |
-| `docker-runtime` (Linux) | `oci/linux.rs`: bundle creation plus task lifecycle (`start`/`wait`/`kill`/`delete`/`take_stdio`); helper process group, SIGKILL to the whole group, SIGTERM forwarding, cached exit status, one-waiter guard, and bundle cleanup. `init.rs` + `docker-runtime-init`: two-stage init. Stage 1 creates mount/UTS/IPC/PID (+ optional network) namespaces, private mount propagation, recursive rootfs bind, hostname, then forks stage 2 and forwards signals. Stage 2 is PID 1 in the new namespace; it chroots, mounts `/proc` in the correct PID namespace, remounts a read-only root, applies supplementary groups/GID/UID/`no_new_privs`, and `exec`s the container process. `nix` 0.30 safe APIs and `signal-hook` are used exclusively with `unsafe_code = "forbid"`. |
+| `docker-runtime` (Linux) | `oci/linux.rs`: bundle creation plus task lifecycle (`start`/`wait`/`kill`/`delete`/`take_stdio`); helper process group, SIGKILL to the whole group, SIGTERM forwarding, cached exit status, one-waiter guard, and bundle cleanup. `init.rs` + `docker-runtime-init`: two-stage init. Stage 1 creates mount/UTS/IPC/PID (+ optional network) namespaces, private mount propagation, recursive rootfs bind, hostname, then blocks its forwarded signals plus `SIGCHLD`, forks stage 2, and stays single-threaded: a `signalfd` forwards signals to stage 2 and `SIGCHLD` drives the `waitpid` reap. A helper thread is impossible here because the kernel rejects `clone(CLONE_THREAD)` with `EINVAL` once `unshare(CLONE_NEWPID)` has made `pid_ns_for_children` differ from the active PID namespace, and `unshare` itself requires a single-threaded caller. Stage 2 is PID 1 in the new namespace; it restores the default signal mask (exec preserves it), chroots, mounts `/proc` in the correct PID namespace, remounts a read-only root, applies supplementary groups/GID/UID/`no_new_privs`, and `exec`s the container process. `nix` 0.30 safe APIs only (`unsafe_code = "forbid"`). |
 | `docker-daemon` | `runtime.rs` now re-exports the shared boundary; `engine.rs` constructs `RuntimeConfig::new(...)` and otherwise keeps the Milestone D supervisor unchanged. |
 | `tests` | `crates/runtime/tests/schema.rs`: a draft-04 subset validator loads `config-schema.json`, `state-schema.json`, `defs*.json`, and `config-linux.json` directly from `upstream/runtime-spec/schema/`; generated bundle and state documents validate, and a negative test proves required-field detection. `runtime_windows.rs`: create on this host returns `Unsupported` naming Linux and the current OS. Bundle/model unit tests cover env merge order, default hostname, namespace mapping, resources, bridge annotation, numeric users, rootfs checks, round-trip, and conflict handling. |
 
 Exit status: the portable bundle/schema/validation half is complete. The Linux
 execution half is written, compiles for `x86_64-unknown-linux-gnu`, and the
-whole workspace (including schema tests) is green on CI's
-`ubuntu-latest`. The remaining E verification gap is the root smoke test: the
-runtime init helper currently exits 101 (a Rust panic somewhere inside), and
-the helper's stderr is now drained and reported by the test plus mirrored into
-the CI job summary to identify the cause. Treat runtime behavior as unverified
-until that root step is green.
+whole workspace (including schema tests) is green on CI's `ubuntu-latest`.
+The root smoke test's init-helper panic is diagnosed and fixed: stage 1 spawned
+its signal-forwarding thread *after* `unshare(CLONE_NEWPID)`, and the kernel
+rejects `clone(CLONE_THREAD)` with `EINVAL` once `pid_ns_for_children` differs
+from the active PID namespace (threads cannot join another PID namespace;
+`unshare` also requires a single-threaded caller). Stage 1 now stays
+single-threaded and uses a blocked signal mask plus `signalfd`, with `SIGCHLD`
+reaping stage 2. A fresh `ubuntu-latest` run must confirm the flow before
+runtime behavior is marked verified.
 
 ## Milestone F/G — what exists, file by file
 
