@@ -14,33 +14,46 @@
 //! namespace, not the `pid_ns_for_children` pointer set by `unshare`.
 //! Mounting before the fork would expose host PIDs inside the container.
 //!
+//! Stage 1 stays **single-threaded**. After `unshare(CLONE_NEWPID)`,
+//! `pid_ns_for_children` differs from the active PID namespace, and the kernel
+//! rejects every `clone(CLONE_THREAD)` with `EINVAL` because a thread cannot
+//! join another PID namespace; `unshare` itself also requires a single-threaded
+//! caller. Signal forwarding therefore uses a blocked signal mask plus a
+//! `signalfd`, with `SIGCHLD` driving the child reap instead of a helper thread.
+//!
 //! This is intentionally smaller than runc: unsupported OCI fields are
 //! rejected by [`crate::oci::ensure_supported`] before the helper starts.
 
-use std::collections::VecDeque;
 use std::fs;
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, ExitStatus};
-use std::sync::{Arc, Mutex};
+use std::process::Command;
 
 use docker_errors::{Error, Result};
+use nix::errno::Errno;
 use nix::mount::{mount, MsFlags};
 use nix::sched::{unshare, CloneFlags};
 use nix::sys::prctl::set_no_new_privs;
-use nix::sys::signal::{kill, Signal};
+use nix::sys::signal::{kill, sigprocmask, SigSet, SigmaskHow, Signal};
+use nix::sys::signalfd::{SfdFlags, SignalFd};
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{
     chdir, chroot, getpid, setgid, setgroups, sethostname, setpgid, setuid, Gid, Pid, Uid,
 };
-use signal_hook::consts::{SIGALRM, SIGHUP, SIGINT, SIGPIPE, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2};
-use signal_hook::iterator::Signals;
 
 use crate::bundle::Bundle;
 use crate::oci::ensure_supported;
 use crate::spec::{LinuxNamespaceType, Process, Spec};
 
-const FORWARDED_SIGNALS: [i32; 8] = [
-    SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2, SIGALRM, SIGPIPE,
+const FORWARDED_SIGNALS: [Signal; 8] = [
+    Signal::SIGHUP,
+    Signal::SIGINT,
+    Signal::SIGQUIT,
+    Signal::SIGTERM,
+    Signal::SIGUSR1,
+    Signal::SIGUSR2,
+    Signal::SIGALRM,
+    Signal::SIGPIPE,
 ];
 
 /// Stage 1 entry point: create namespaces, fork PID 1, wait, and propagate the
@@ -103,72 +116,77 @@ pub fn run_stage1(bundle_path: &Path) -> Result<i32> {
             .map_err(|err| Error::internal(format!("setting hostname: {err}")))?;
     }
 
-    // Signal handlers must be installed before spawning stage 2 so a stop
-    // racing with startup is not lost. Handlers are reset to default by exec,
-    // so the container process itself receives normal signals.
-    let pending = Arc::new(Mutex::new(VecDeque::<i32>::new()));
-    let child_pid = Arc::new(Mutex::new(None::<i32>));
-    let mut signals = Signals::new(FORWARDED_SIGNALS)
-        .map_err(|err| Error::internal(format!("installing signal handlers: {err}")))?;
-    let signal_handle = signals.handle();
-    let thread_pending = Arc::clone(&pending);
-    let thread_pid = Arc::clone(&child_pid);
-    let signal_thread = std::thread::spawn(move || {
-        for signal in signals.forever() {
-            let pid = *thread_pid
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            match pid {
-                Some(pid) => forward(pid, signal),
-                None => thread_pending
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .push_back(signal),
-            }
-        }
-    });
+    // Block the signals stage 1 forwards plus SIGCHLD and consume them from a
+    // signalfd. See the module docs for why a forwarding thread is impossible
+    // after `unshare(CLONE_NEWPID)`.
+    let mut mask = SigSet::empty();
+    for signal in FORWARDED_SIGNALS {
+        mask.add(signal);
+    }
+    mask.add(Signal::SIGCHLD);
+    sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)
+        .map_err(|err| Error::internal(format!("blocking signals in runtime init: {err}")))?;
+    let signal_fd = SignalFd::with_flags(&mask, SfdFlags::SFD_CLOEXEC)
+        .map_err(|err| Error::internal(format!("creating the runtime init signalfd: {err}")))?;
 
     let stage2 = std::env::current_exe()
         .map_err(|err| Error::internal(format!("locating stage 2 executable: {err}")))?;
-    let mut child = Command::new(stage2)
+    // Signals sent while stage 2 is being spawned stay pending on the blocked
+    // mask and are consumed by the loop below, so a stop racing with startup
+    // is not lost.
+    let child = Command::new(stage2)
         .arg("--stage2")
         .arg("--bundle")
         .arg(bundle_path)
         .spawn()
         .map_err(|err| Error::internal(format!("starting stage 2 init: {err}")))?;
+    let child_pid = Pid::from_raw(child.id() as i32);
 
-    {
-        let mut slot = child_pid
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        *slot = Some(child.id() as i32);
+    loop {
+        let info = signal_fd
+            .read_signal()
+            .map_err(|err| Error::internal(format!("reading runtime init signals: {err}")))?;
+        let Some(info) = info else { continue };
+        let Ok(number) = i32::try_from(info.ssi_signo) else {
+            continue;
+        };
+        let Ok(signal) = Signal::try_from(number) else {
+            continue;
+        };
+        if signal != Signal::SIGCHLD {
+            forward(child_pid, signal);
+            continue;
+        }
+        match waitpid(child_pid, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => continue,
+            Ok(WaitStatus::Exited(_, code)) => return Ok(code),
+            Ok(WaitStatus::Signaled(_, signal, _)) => return Ok(128 + signal as i32),
+            // SIGCHLD is also generated for stop/continue notifications; the
+            // child has not exited yet, so keep waiting.
+            Ok(_) => continue,
+            Err(Errno::ECHILD) => {
+                return Err(Error::internal(
+                    "stage 2 exited but could not be reaped (ECHILD)",
+                ))
+            }
+            Err(err) => {
+                return Err(Error::internal(format!(
+                    "waiting for the container process: {err}"
+                )))
+            }
+        }
     }
-    let queued: Vec<i32> = {
-        let mut pending = pending.lock().unwrap_or_else(|poison| poison.into_inner());
-        pending.drain(..).collect()
-    };
-    for signal in queued {
-        forward(child.id() as i32, signal);
-    }
-
-    let status = child.wait();
-    {
-        let mut slot = child_pid
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        *slot = None;
-    }
-    signal_handle.close();
-    let _ = signal_thread.join();
-
-    let status =
-        status.map_err(|err| Error::internal(format!("waiting for container process: {err}")))?;
-    Ok(exit_code(status))
 }
 
 /// Stage 2 entry point. This process must already be PID 1 in the container's
 /// PID namespace and share stage 1's mount namespace.
 pub fn run_stage2(bundle_path: &Path) -> Result<i32> {
+    // Stage 1 blocks the signals it forwards (and SIGCHLD) for its signalfd,
+    // and `exec` preserves the signal mask. Restore the default before the
+    // container process starts so it can be stopped and killed normally.
+    sigprocmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None)
+        .map_err(|err| Error::internal(format!("restoring the signal mask in stage 2: {err}")))?;
+
     let bundle = Bundle::open(bundle_path)?;
     let spec = bundle.spec();
     ensure_supported(spec)?;
@@ -311,18 +329,6 @@ fn environment(process: &Process) -> Result<Vec<(&str, &str)>> {
     Ok(environment)
 }
 
-fn forward(pid: i32, signal: i32) {
-    if let Ok(signal) = Signal::try_from(signal) {
-        let _ = kill(Pid::from_raw(pid), signal);
-    }
-}
-
-fn exit_code(status: ExitStatus) -> i32 {
-    if let Some(code) = status.code() {
-        code
-    } else if let Some(signal) = status.signal() {
-        128 + signal
-    } else {
-        255
-    }
+fn forward(pid: Pid, signal: Signal) {
+    let _ = kill(pid, signal);
 }
