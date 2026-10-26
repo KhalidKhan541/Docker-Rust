@@ -33,12 +33,12 @@ use docker_errors::{Error, Result};
 use nix::errno::Errno;
 use nix::mount::{mount, MsFlags};
 use nix::sched::{unshare, CloneFlags};
-use nix::sys::prctl::set_no_new_privs;
+use nix::sys::prctl::{set_no_new_privs, set_pdeathsig};
 use nix::sys::signal::{kill, sigprocmask, SigSet, SigmaskHow, Signal};
 use nix::sys::signalfd::{SfdFlags, SignalFd};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{
-    chdir, chroot, getpid, setgid, setgroups, sethostname, setpgid, setuid, Gid, Pid, Uid,
+    chdir, chroot, getpid, getppid, setgid, setgroups, sethostname, setpgid, setuid, Gid, Pid, Uid,
 };
 
 use crate::bundle::Bundle;
@@ -59,6 +59,7 @@ const FORWARDED_SIGNALS: [Signal; 8] = [
 /// Stage 1 entry point: create namespaces, fork PID 1, wait, and propagate the
 /// container exit code.
 pub fn run_stage1(bundle_path: &Path) -> Result<i32> {
+    arm_parent_death_signal("stage 1")?;
     let bundle = Bundle::open(bundle_path)?;
     let spec = bundle.spec();
     ensure_supported(spec)?;
@@ -181,6 +182,12 @@ pub fn run_stage1(bundle_path: &Path) -> Result<i32> {
 /// Stage 2 entry point. This process must already be PID 1 in the container's
 /// PID namespace and share stage 1's mount namespace.
 pub fn run_stage2(bundle_path: &Path) -> Result<i32> {
+    // Stage 2 is PID 1 of the container's PID namespace. If stage 1 (and with
+    // it the daemon) dies, the kernel must tear the namespace down instead of
+    // leaving a process the restarted daemon cannot adopt. The setting is
+    // dropped when credentials change and preserved by a non-setuid `exec`, so
+    // it is armed here for setup and re-armed after `apply_identity` below.
+    arm_parent_death_signal("stage 2")?;
     // Stage 1 blocks the signals it forwards (and SIGCHLD) for its signalfd,
     // and `exec` preserves the signal mask. Restore the default before the
     // container process starts so it can be stopped and killed normally.
@@ -251,6 +258,11 @@ pub fn run_stage2(bundle_path: &Path) -> Result<i32> {
     }
 
     apply_identity(process)?;
+
+    // Changing the effective/filesystem UID or GID clears PR_SET_PDEATHSIG
+    // (prctl(2)), so restore it after dropping to the container user and
+    // before exec. A non-setuid exec preserves the setting.
+    arm_parent_death_signal("stage 2 after the identity change")?;
 
     let mut command = Command::new(&process.args[0]);
     command
@@ -327,6 +339,29 @@ fn environment(process: &Process) -> Result<Vec<(&str, &str)>> {
         environment.push((key, value));
     }
     Ok(environment)
+}
+
+/// Tie this helper to the process/thread that spawned it. The daemon actor
+/// thread owns the task, so an abrupt daemon death (SIGKILL, panic, OOM)
+/// delivers SIGKILL here instead of leaving an orphaned container process the
+/// restarted daemon cannot adopt. When stage 2 (PID 1 of the container's PID
+/// namespace) dies, the kernel kills the rest of the namespace.
+///
+/// The parent is sampled before and after `prctl` so the check also works when
+/// the daemon itself is PID 1 of its own namespace.
+fn arm_parent_death_signal(stage: &str) -> Result<()> {
+    let parent = getppid();
+    set_pdeathsig(Signal::SIGKILL).map_err(|err| {
+        Error::internal(format!(
+            "setting the parent-death signal for {stage}: {err}"
+        ))
+    })?;
+    if getppid() != parent {
+        return Err(Error::internal(format!(
+            "parent exited before {stage} initialized"
+        )));
+    }
+    Ok(())
 }
 
 fn forward(pid: Pid, signal: Signal) {
