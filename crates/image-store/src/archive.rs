@@ -787,13 +787,25 @@ fn unpack_archive<R: Read>(reader: R, directory: &Path) -> Result<()> {
         }
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
+        let kind = entry.header().entry_type();
         let Some(relative) = sanitize_relative(&path) else {
+            // GNU tar emits a `./` directory entry when archiving `.`. It
+            // names the extraction root itself and carries no content, so it
+            // is safe to skip. Anything else that sanitizes to nothing
+            // (absolute paths, `..`, an empty name) stays an error.
+            if kind.is_dir()
+                && !path.as_os_str().is_empty()
+                && path
+                    .components()
+                    .all(|component| matches!(component, Component::CurDir))
+            {
+                continue;
+            }
             return Err(Error::invalid_argument(format!(
                 "image archive contains an unsafe path: {}",
                 path.display()
             )));
         };
-        let kind = entry.header().entry_type();
         let destination = directory.join(&relative);
         if kind.is_dir() {
             fs::create_dir_all(&destination)?;
@@ -1088,6 +1100,25 @@ mod tests {
         builder.into_inner().unwrap()
     }
 
+    fn tar_archive_with_root_entry(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut builder = Builder::new(Vec::new());
+        // GNU tar emits a `./` directory entry for `tar -C dir -cf x.tar .`.
+        let mut root = Header::new_gnu();
+        root.set_entry_type(tar::EntryType::Directory);
+        root.set_size(0);
+        root.set_mode(0o755);
+        root.set_cksum();
+        builder.append_data(&mut root, "./", io::empty()).unwrap();
+        for (path, bytes) in entries {
+            let mut header = Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, path, *bytes).unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
     #[test]
     fn loads_a_legacy_manifest_archive_and_exports_all_repository_tags() {
         let directory = tempfile::tempdir().unwrap();
@@ -1180,6 +1211,37 @@ mod tests {
         archive.resize(512 + data.len().div_ceil(512) * 512, 0);
         archive.extend_from_slice(&[0u8; 1024]);
         archive
+    }
+
+    #[test]
+    fn loads_an_archive_with_a_gnu_tar_root_entry() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ImageStore::open(directory.path().join("images")).unwrap();
+
+        let layer = tar_archive(&[("hello.txt", b"hello\n")]);
+        let config = serde_json::to_vec(&serde_json::json!({
+            "architecture": "amd64",
+            "os": "linux",
+            "config": {"Cmd": ["/hello"]},
+            "history": []
+        }))
+        .unwrap();
+        let manifest = serde_json::to_vec(&serde_json::json!([{
+            "Config": "config.json",
+            "RepoTags": ["root-entry:1"],
+            "Layers": ["layer.tar"]
+        }]))
+        .unwrap();
+        let archive = tar_archive_with_root_entry(&[
+            ("manifest.json", &manifest),
+            ("config.json", &config),
+            ("layer.tar", &layer),
+        ]);
+
+        let outcome = store
+            .load_archive(&mut io::Cursor::new(archive), None)
+            .unwrap();
+        assert_eq!(outcome.images[0].tags, vec!["root-entry:1".to_string()]);
     }
 
     #[test]
