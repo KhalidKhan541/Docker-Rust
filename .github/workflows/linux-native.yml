@@ -49,6 +49,29 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+      - name: Static console smoke test
+        run: |
+          set +e
+          set -o pipefail
+          bash tests/static-console-smoke.sh 2>&1 | tee static-smoke.log
+          status=${PIPESTATUS[0]}
+          set -e
+          {
+            echo "### Static console smoke test"
+            echo
+            echo '```'
+            cat static-smoke.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -ne 0 ]; then
+            excerpt=$(tail -c 8000 static-smoke.log)
+            excerpt=${excerpt//'%'/'%25'}
+            excerpt=${excerpt//$'\r'/'%0D'}
+            excerpt=${excerpt//$'\n'/'%0A'}
+            echo "::error title=Static console smoke test::${excerpt}"
+          fi
+          exit "$status"
+
       - name: Build native runtime smoke test
         run: cargo test -p docker-rs-integration --test native_runtime --no-run --message-format=json > native-test-artifacts.json
 

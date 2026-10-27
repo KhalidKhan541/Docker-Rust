@@ -47,6 +47,8 @@ Options:
   --runtime <NAME>       Execution backend: synthetic (default) or oci
                          (oci requires Linux, root, and a built
                          docker-runtime-init next to docker-rsd)
+  --web-root <DIR>       Serve the local console/static site from DIR on the
+                         same TCP listener (Engine API paths take precedence)
   -h, --help             Print this help
   -V, --version          Print the version
 
@@ -75,6 +77,7 @@ fn run() -> Result<()> {
         }
         Command::Run(options) => options,
     };
+    let web_root = options.web_root.clone();
 
     let mut config = DaemonConfig::default();
     if let Some(path) = options.config {
@@ -158,10 +161,13 @@ fn run() -> Result<()> {
         synthetic,
         ..ServerConfig::default()
     };
-    let api = Arc::new(
-        ApiServer::with_config(daemon, Arc::clone(&broker), server_config)?
-            .with_image_store(Arc::clone(&images)),
-    );
+    let api = ApiServer::with_config(daemon, Arc::clone(&broker), server_config)?
+        .with_image_store(Arc::clone(&images));
+    let api = match &web_root {
+        Some(root) => api.with_web_root(root)?,
+        None => api,
+    };
+    let api = Arc::new(api);
     let server = api.serve(&listen)?;
     tracing::info!(address = %server.addr(), "docker-rsd listening");
     println!("docker-rsd listening on http://{}", server.addr());
@@ -171,6 +177,14 @@ fn run() -> Result<()> {
         "container store: {}",
         config.data_root.join("containers").display()
     );
+    if let Some(root) = &web_root {
+        println!(
+            "web console: http://{}/console.html (landing page: http://{}/)",
+            server.addr(),
+            server.addr()
+        );
+        println!("web root: {}", root.display());
+    }
     if synthetic {
         println!(
             "warning: synthetic runtime is active; container lifecycle is real, but no host process is executed"
@@ -203,6 +217,7 @@ struct Options {
     config: Option<PathBuf>,
     log_level: Option<String>,
     runtime: Option<String>,
+    web_root: Option<PathBuf>,
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Command> {
@@ -238,6 +253,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Command> {
             "--config" => options.config = Some(PathBuf::from(value("--config")?)),
             "--log-level" => options.log_level = Some(value("--log-level")?),
             "--runtime" => options.runtime = Some(value("--runtime")?),
+            "--web-root" => options.web_root = Some(PathBuf::from(value("--web-root")?)),
             other => {
                 return Err(Error::invalid_argument(format!(
                     "unknown option `{other}`; run docker-rsd --help"
@@ -302,8 +318,19 @@ mod tests {
                 config: Some(PathBuf::from("daemon.json")),
                 log_level: Some("debug".into()),
                 runtime: Some("synthetic".into()),
+                web_root: None,
             })
         );
+    }
+
+    #[test]
+    fn parses_web_root_in_both_forms() {
+        let expected = Command::Run(Options {
+            web_root: Some(PathBuf::from("web")),
+            ..Options::default()
+        });
+        assert_eq!(parse_args(args(&["--web-root", "web"])).unwrap(), expected);
+        assert_eq!(parse_args(args(&["--web-root=web"])).unwrap(), expected);
     }
 
     #[test]
@@ -320,6 +347,10 @@ mod tests {
         );
         assert_eq!(
             parse_args(args(&["--host"])).unwrap_err().kind(),
+            docker_errors::ErrorKind::InvalidArgument
+        );
+        assert_eq!(
+            parse_args(args(&["--web-root"])).unwrap_err().kind(),
             docker_errors::ErrorKind::InvalidArgument
         );
     }

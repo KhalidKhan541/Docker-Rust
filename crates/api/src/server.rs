@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -36,6 +37,7 @@ use crate::image_dto::{
     ImageSummary,
 };
 use crate::query::{ContainerListOptions, EventFilters, EventOptions, LogsOptions, Query};
+use crate::static_files::{StaticFiles, StaticOutcome};
 use crate::version::{self, VersionDecision, VersionGate, VersionUnsupported};
 
 use docker_daemon::{LogEntry, LogStore, Stream as LogStreamSource};
@@ -77,6 +79,7 @@ pub struct ApiServer {
     gate: VersionGate,
     config: ServerConfig,
     daemon_id: String,
+    web: Option<StaticFiles>,
 }
 
 impl ApiServer {
@@ -101,6 +104,7 @@ impl ApiServer {
             gate,
             config,
             daemon_id: random_hex(16),
+            web: None,
         })
     }
 
@@ -110,6 +114,22 @@ impl ApiServer {
     pub fn with_image_store(mut self, images: Arc<ImageStore>) -> Self {
         self.images = Some(images);
         self
+    }
+
+    /// Serve static files from `root` on the same listener.
+    ///
+    /// This is a docker-rs extension for its local console, not a Docker
+    /// Engine endpoint. Engine API namespaces (including `/vX.Y/...`) always
+    /// take precedence, so a static file can not shadow an API route.
+    pub fn with_web_root(mut self, root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
+        self.web = Some(StaticFiles::open(root).map_err(|error| {
+            Error::invalid_argument(format!(
+                "cannot serve web root `{}`: {error}",
+                root.display()
+            ))
+        })?);
+        Ok(self)
     }
 
     /// Bind and serve on `addr`. The returned handle stops the accept loop on
@@ -163,6 +183,7 @@ impl ApiServer {
                 status,
                 content_type,
                 body,
+                content_length,
                 headers,
             }) => {
                 let mut response_headers = self.base_headers();
@@ -170,7 +191,7 @@ impl ApiServer {
                 if let Some(content_type) = content_type {
                     response_headers.push(header("Content-Type", content_type));
                 }
-                let length = body.len();
+                let length = content_length.unwrap_or(body.len());
                 let response = Response::new(
                     StatusCode(status),
                     response_headers,
@@ -282,7 +303,57 @@ impl ApiServer {
             ["images", "get"] if method == "GET" => self.image_save(&query),
             ["images", "load"] if method == "POST" => self.image_load(request, &query),
             ["images", rest @ ..] => self.route_image(method, rest, &query),
+            _ if requested.is_none() && self.web.is_some() && !is_api_namespace(path) => {
+                self.static_page(path, method)
+            }
             _ => Err(ApiError::not_found("page not found")),
+        }
+    }
+
+    fn static_page(&self, path: &str, method: &str) -> std::result::Result<Reply, ApiError> {
+        let Some(files) = &self.web else {
+            return Err(ApiError::not_found("page not found"));
+        };
+        if method != "GET" && method != "HEAD" {
+            // Only advertise 405 for a page that actually exists; an unknown
+            // path keeps the ordinary 404.
+            return match files.serve(path, true) {
+                StaticOutcome::Found { .. } | StaticOutcome::TooLarge => Ok(Reply::buffered(
+                    405,
+                    "text/plain; charset=utf-8",
+                    b"method not allowed".to_vec(),
+                )
+                .with_headers(vec![header("Allow", "GET, HEAD")])),
+                _ => Err(ApiError::not_found("page not found")),
+            };
+        }
+        match files.serve(path, method == "HEAD") {
+            StaticOutcome::Found {
+                body,
+                content_type,
+                length,
+            } => {
+                let reply = Reply::buffered(200, content_type, body);
+                let reply = if method == "HEAD" {
+                    reply.with_content_length(length)
+                } else {
+                    reply
+                };
+                Ok(reply.with_headers(vec![
+                    header("Cache-Control", "no-cache"),
+                    header("X-Content-Type-Options", "nosniff"),
+                ]))
+            }
+            StaticOutcome::NotFound => Err(ApiError::not_found("page not found")),
+            StaticOutcome::TooLarge => Ok(Reply::buffered(
+                413,
+                "text/plain; charset=utf-8",
+                b"static file is too large".to_vec(),
+            )),
+            StaticOutcome::Io(error) => Err(ApiError {
+                status: 500,
+                message: format!("cannot read static file: {error}"),
+            }),
         }
     }
 
@@ -1005,6 +1076,7 @@ enum Reply {
         status: u16,
         content_type: Option<&'static str>,
         body: Vec<u8>,
+        content_length: Option<usize>,
         headers: Vec<Header>,
     },
     Stream {
@@ -1020,6 +1092,7 @@ impl Reply {
             status,
             content_type: Some(content_type),
             body,
+            content_length: None,
             headers: Vec::new(),
         }
     }
@@ -1031,6 +1104,7 @@ impl Reply {
                 status: 500,
                 content_type: Some("application/json"),
                 body: format!("{{\"message\":\"JSON encoding failed: {error}\"}}").into_bytes(),
+                content_length: None,
                 headers: Vec::new(),
             },
         }
@@ -1041,6 +1115,7 @@ impl Reply {
             status,
             content_type: None,
             body: Vec::new(),
+            content_length: None,
             headers: Vec::new(),
         }
     }
@@ -1056,6 +1131,13 @@ impl Reply {
     fn with_headers(mut self, extra: Vec<Header>) -> Self {
         match &mut self {
             Self::Buffered { headers, .. } | Self::Stream { headers, .. } => headers.extend(extra),
+        }
+        self
+    }
+
+    fn with_content_length(mut self, length: usize) -> Self {
+        if let Self::Buffered { content_length, .. } = &mut self {
+            *content_length = Some(length);
         }
         self
     }
@@ -1313,6 +1395,42 @@ fn hex_digit(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
+}
+
+/// Top-level Docker Engine API namespaces. Static files must not shadow paths
+/// in these namespaces even when the daemon does not implement the endpoint:
+/// the correct answer is an API 404/Unsupported, not a page.
+fn is_api_namespace(path: &str) -> bool {
+    let first = path
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    matches!(
+        first,
+        "_ping"
+            | "auth"
+            | "build"
+            | "commit"
+            | "configs"
+            | "containers"
+            | "distribution"
+            | "events"
+            | "exec"
+            | "images"
+            | "info"
+            | "networks"
+            | "nodes"
+            | "plugins"
+            | "secrets"
+            | "services"
+            | "session"
+            | "swarm"
+            | "system"
+            | "tasks"
+            | "version"
+            | "volumes"
+    )
 }
 
 fn header(name: &str, value: &str) -> Header {

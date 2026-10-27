@@ -6,6 +6,8 @@
 
 #![forbid(unsafe_code)]
 
+mod static_files;
+
 pub mod dto;
 pub mod image_dto;
 pub mod query;

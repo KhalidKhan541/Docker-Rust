@@ -7,8 +7,10 @@
 //! exercising the actual `tiny_http` transport instead of a mock router.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::thread;
@@ -110,7 +112,7 @@ fn http(
         .get("content-length")
         .and_then(|value| value.parse::<usize>().ok());
     let mut response_body = Vec::new();
-    if status == 204 || status == 304 {
+    if method == "HEAD" || status == 204 || status == 304 {
         // No response body by HTTP semantics.
     } else if chunked {
         loop {
@@ -162,6 +164,16 @@ fn spawn_api() -> (RunningServer, Arc<SyntheticRuntime>) {
     let api = Arc::new(ApiServer::new(daemon, broker));
     let server = api.serve("127.0.0.1:0").unwrap();
     (server, runtime)
+}
+
+fn spawn_api_with_web_root(root: &Path) -> RunningServer {
+    let runtime = Arc::new(SyntheticRuntime::with_behavior(
+        SyntheticBehavior::running_until_killed(),
+    ));
+    let broker = Arc::new(EventBroker::new());
+    let daemon = Arc::new(Daemon::spawn(runtime, broker.clone()).unwrap());
+    let api = ApiServer::new(daemon, broker).with_web_root(root).unwrap();
+    Arc::new(api).serve("127.0.0.1:0").unwrap()
 }
 
 fn create_body(image: &str, name_label: Option<&str>) -> Value {
@@ -365,6 +377,79 @@ fn ping_version_gate_and_system_endpoints() {
     assert_eq!(missing.status, 404);
     assert_eq!(missing.header("api-version"), Some("1.51"));
     assert_eq!(missing.json()["message"], "page not found");
+
+    // Static serving is opt-in; without a web root `/` stays an API 404.
+    assert_eq!(http(addr, "GET", "/", None, None).status, 404);
+}
+
+#[test]
+fn serves_a_web_console_without_shadowing_api_paths() {
+    let web = tempfile::tempdir().unwrap();
+    fs::write(web.path().join("index.html"), b"<h1>docker-rs</h1>").unwrap();
+    fs::write(web.path().join("console.html"), b"<h1>console</h1>").unwrap();
+    fs::create_dir(web.path().join("assets")).unwrap();
+    fs::write(web.path().join("assets/app.js"), b"console.log('ok');").unwrap();
+    fs::create_dir(web.path().join("containers")).unwrap();
+    fs::write(web.path().join("containers/json"), b"must not shadow").unwrap();
+    fs::write(web.path().join("networks"), b"must not shadow").unwrap();
+    fs::create_dir(web.path().join("v1.51")).unwrap();
+    fs::write(web.path().join("v1.51/console.html"), b"versioned").unwrap();
+
+    let server = spawn_api_with_web_root(web.path());
+    let addr = server.addr();
+
+    let index = http(addr, "GET", "/", None, None);
+    assert_eq!(index.status, 200, "{}", index.text());
+    assert_eq!(
+        index.header("content-type"),
+        Some("text/html; charset=utf-8")
+    );
+    assert_eq!(index.header("x-content-type-options"), Some("nosniff"));
+    assert_eq!(index.text(), "<h1>docker-rs</h1>");
+
+    let console = http(addr, "GET", "/console", None, None);
+    assert_eq!(console.status, 200);
+    assert_eq!(console.text(), "<h1>console</h1>");
+
+    let js = http(addr, "GET", "/assets/app.js", None, None);
+    assert_eq!(js.status, 200);
+    assert_eq!(
+        js.header("content-type"),
+        Some("text/javascript; charset=utf-8")
+    );
+    assert_eq!(js.text(), "console.log('ok');");
+
+    // API namespaces win over files with the same name.
+    let containers = http(addr, "GET", "/containers/json", None, None);
+    assert_eq!(containers.status, 200);
+    assert!(containers.json().is_array());
+    assert!(!containers.text().contains("must not shadow"));
+
+    let networks = http(addr, "GET", "/networks", None, None);
+    assert_eq!(networks.status, 404);
+    assert!(!networks.text().contains("must not shadow"));
+
+    // Version-prefixed paths are API paths even when the static tree has a
+    // matching file.
+    let versioned = http(addr, "GET", "/v1.51/console.html", None, None);
+    assert_eq!(versioned.status, 404);
+    assert!(!versioned.text().contains("versioned"));
+
+    assert_eq!(http(addr, "GET", "/missing", None, None).status, 404);
+    assert_eq!(
+        http(addr, "GET", "/%2e%2e/Cargo.toml", None, None).status,
+        404
+    );
+
+    let post = http(addr, "POST", "/console.html", None, None);
+    assert_eq!(post.status, 405);
+    assert_eq!(post.header("allow"), Some("GET, HEAD"));
+    assert_eq!(http(addr, "POST", "/missing", None, None).status, 404);
+
+    let head = http(addr, "HEAD", "/index.html", None, None);
+    assert_eq!(head.status, 200);
+    assert!(head.body.is_empty());
+    assert_eq!(head.header("content-length"), Some("18"));
 }
 
 #[test]
