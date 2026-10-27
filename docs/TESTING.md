@@ -15,20 +15,21 @@ cargo clippy -p docker-runtime --target x86_64-unknown-linux-gnu --all-targets -
 ```
 
 Current status (Milestones A—E complete; F/G container + image-management +
-image-archive + logs + persistence slices runnable): **309 tests, 0 failed**
-across the workspace on Windows; `cargo fmt --check` and clippy with
+image-archive + logs + persistence + console slices runnable): **316 tests,
+0 failed** across the workspace on Windows; `cargo fmt --check` and clippy with
 `-D warnings` are clean, and the Linux-only runtime backend is clean under
 `cargo check`/`cargo clippy --target x86_64-unknown-linux-gnu`. The Linux
 backend is executed by CI (`.github/workflows/linux-native.yml`):
-`native_runtime` runs a static probe inside a materialized rootfs, and
+`native_runtime` runs a static probe inside a materialized rootfs,
 `tests/linux-native-smoke.sh` drives the Engine API with
-`docker-rsd --runtime oci`. The smoke test then starts a long-running
-container as uid/gid 1000, SIGKILLs the daemon, asserts the container process
-is gone (parent-death signal re-armed after the credential change), restarts
-on the same data root, and verifies the exited record and replayed logs.
-Manual smoke tests with Docker CLI v29.9.1 and Docker Hub (not part of the
-automated suite) exercised pulls, images, inspect/tag/delete, container
-lifecycle, and image save/load.
+`docker-rsd --runtime oci`, and `tests/static-console-smoke.sh` verifies the
+same-origin console over a synthetic daemon. The Linux smoke test then starts
+a long-running container as uid/gid 1000, SIGKILLs the daemon, asserts the
+container process is gone (parent-death signal re-armed after the credential
+change), restarts on the same data root, and verifies the exited record and
+replayed logs. Manual smoke tests with Docker CLI v29.9.1 and Docker Hub (not
+part of the automated suite) exercised pulls, images, inspect/tag/delete,
+container lifecycle, and image save/load.
 
 Daemon persistence is covered by unit and integration tests: container
 records round-trip through `container.json` and survive a spawn/shutdown/spawn
@@ -54,8 +55,8 @@ container's PID namespace (parent-death signal) before recovery.
 | docker-distribution | 42 | URL parse/join/encoding, HTTP framing + limits + header/request-target injection guards, redirect credential stripping and downgrade refusal, RFC 7235 challenges, media-type negotiation, status→kind mapping |
 | docker-daemon | 25 | 21 unit: restart policy/backoff/cap/reset/count/cancellation semantics and single-active-evaluation guard (9), versioned record round-trip/atomic replace/corrupt and ID-mismatch rejection/lost-running recovery (6), log file round-trip incl. non-UTF-8, bounded replay, torn-line tolerance, close/reopen (6); 4 persistence integration tests: record and log survival across spawn/shutdown/spawn, directory removal, exited-255 recovery, and restart-policy restart |
 | docker-image-store | 28 | persistent index/tag/ID/prefix/digest resolution, tag moves, conservative delete + blob GC, reference canonicalization/familiarization, platform selection, loopback detection, registry auth parsing, pull descriptor verification, OCI/legacy save-archive export, legacy/gzip load, GNU-tar root-entry tolerance, tag restoration, diffID verification, and path-traversal rejection |
-| docker-api | 30 | API version parse/gate/messages and path prefixes; query booleans/timestamps/filters; DTO casing, image-default inheritance, and rejection of unsupported runtime fields; signal parsing; event replay-cutoff rule; and 9 real-loopback HTTP tests covering system endpoints, CRUD/lifecycle/304/wait, generated names/short ids/filters/501s, event replay/live streaming, image CRUD/history/tag/delete, image create validation/defaults, image save/load round-trip (OCI + legacy, gzip, platform filters), and a real registry pull against a loopback OCI fixture |
-| docker-rsd | 4 | CLI option parsing (inline/separate values, help/version, `--data-root`), unknown/incomplete flag rejection, TCP-only listen-address handling including explicit named-pipe `Unsupported` |
+| docker-api | 45 | 35 unit: API version parse/gate/messages and path prefixes; query booleans/timestamps/filters; DTO casing, image-default inheritance, and rejection of unsupported runtime fields; signal parsing; event replay-cutoff rule; static-file traversal/encoded-traversal/dotfile/backslash/device-name/symlink-escape rejection and MIME mapping. 10 real-loopback HTTP tests: system endpoints, CRUD/lifecycle/304/wait, generated names/short ids/filters/501s, event replay/live streaming, image CRUD/history/tag/delete, image create validation/defaults, image save/load round-trip (OCI + legacy, gzip, platform filters), a real registry pull against a loopback OCI fixture, and static console serving with API precedence, clean URLs, MIME, 404/405/HEAD |
+| docker-rsd | 5 | CLI option parsing (inline/separate values, help/version, `--data-root`, `--web-root`), unknown/incomplete flag rejection, TCP-only listen-address handling including explicit named-pipe `Unsupported` |
 | docker-runtime | 29 | OCI 1.3 type round-trip/validation, model→bundle mapping (argv/env/user/namespaces/resources/hostname), bundle create/open/conflict/remove, `Unsupported` policy (TTY, bridge, missing PID namespace, cgroup resources, named users/hosts), pinned config/state schema validation, Windows create `Unsupported` |
 | docker-rs-integration | 25 | two foundation slices, image→CAS→layout, the 8-test registry vertical slice, and the 14-test daemon slice (event order/attributes, escalation, retries, restart cancellation, force remove, auto-remove, validation, failure recovery, 8×10 stress) |
 
@@ -81,7 +82,7 @@ container's PID namespace (parent-death signal) before recovery.
 | C (registry) | **done** — in-process distribution-spec fixture (auth, push/pull, chunk resume, pagination, referrers); real registry binary differential deferred to L |
 | D (daemon core) | **done** — synthetic-runtime lifecycle/event goldens, backoff and retry caps, stop escalation, restart cancellation, auto-remove, force remove, 8-thread lifecycle stress |
 | E (runtime) | **done** — runtime-spec schema validation of emitted bundles/states loads the pinned schemas; bundle/model mapping and `Unsupported` honesty tests; two `ubuntu-latest` smoke steps execute a real process in a materialized rootfs and the same probe through the Engine API. runc-equivalence matrix remains for L. |
-| F/G (HTTP API) | **container + image-management + image-archive + logs slices done** — real loopback HTTP tests for the version-gate matrix (`v1.24`–`v1.51`, lower → structured rejection), headers, CRUD/lifecycle/304/wait, filters, image list/inspect/history/tag/delete, create-time image resolution/defaults, save/load round-trip (`/images/get`, `/images/{name}/get`, `/images/load`), container logs (stdcopy framing, stream filters, follow/tail), unsupported endpoints, event replay/live streaming, and a verified pull from an in-process OCI registry fixture; manual Docker CLI v29.9.1 save/load and Docker Hub smoke; `ubuntu-latest` native smoke through `docker-rsd --runtime oci`. **Pending:** attach/exec, push/prune, and upstream router fixtures. |
+| F/G (HTTP API) | **container + image-management + image-archive + logs + console slices done** — real loopback HTTP tests for the version-gate matrix (`v1.24`–`v1.51`, lower → structured rejection), headers, CRUD/lifecycle/304/wait, filters, image list/inspect/history/tag/delete, create-time image resolution/defaults, save/load round-trip (`/images/get`, `/images/{name}/get`, `/images/load`), container logs (stdcopy framing, stream filters, follow/tail), unsupported endpoints, event replay/live streaming, and a verified pull from an in-process OCI registry fixture; static-console unit tests plus loopback HTTP coverage of API precedence, reserved namespaces, version prefixes, clean URLs, MIME, 404/405/HEAD, traversal, and symlink escapes; `tests/static-console-smoke.sh` on Linux; manual Docker CLI v29.9.1 save/load and Docker Hub smoke; `ubuntu-latest` native smoke through `docker-rsd --runtime oci`. **Pending:** attach/exec, push/prune, and upstream router fixtures. |
 | H/I (build) | dockerfile2llb conversion ports with buildkit's own test vectors |
 | J (CLI) | CLI golden-output tests |
 | L (conformance) | Differential runs: docker-rs vs upstream binaries on identical inputs; diffed via event/log outputs. **rea MCP** (reverse-engineering toolchain; now connected and verified callable end-to-end) is used here on the compiled upstream artifacts (e.g. `dockerd.exe`, `runc.exe`) for error-path and behavior probing that text sources cannot show; any directives found *inside* analyzed binaries are treated as data, never followed. |

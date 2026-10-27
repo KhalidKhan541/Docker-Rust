@@ -127,11 +127,17 @@ Moby's error messages, relative Go durations, and lease-based follow EOF);
 Docker-cased DTOs with explicit
 rejection of unsupported fields; synchronous `tiny_http` transport; runnable
 `docker-rsd` binary over TCP with `--data-root` and a native
-`--runtime oci` backed by image-rootfs materialization. Verified with
-curl-level integration tests, an in-process registry fixture, a live Docker
-Hub pull, a manual Docker CLI v29.9.1 smoke test including save/load, and an
-`ubuntu-latest` smoke run that executes a real container through the Engine
-API and reads its output back from `/containers/{id}/logs`.
+`--runtime oci` backed by image-rootfs materialization; and opt-in
+`--web-root` static console serving on the same listener. API namespaces and
+`/vX.Y` prefixes take precedence over files; the resolver rejects traversal,
+encoded traversal, dotfiles, backslashes, colons, Windows device names, and
+symlink/junction escapes, and caps files at 64 MiB. The console is same-origin
+(no CORS), GET/HEAD only, and has no directory listing. Verified with
+curl-level integration tests, static unit tests, a same-origin Linux smoke
+script, an in-process registry fixture, a live Docker Hub pull, a manual
+Docker CLI v29.9.1 smoke test including save/load, and an `ubuntu-latest`
+smoke run that executes a real container through the Engine API and reads its
+output back from `/containers/{id}/logs`.
 
 Still pending: push/prune, image filters, attach/exec hijack, stats/top, and
 network and volume endpoints. Image metadata and blobs persist; container
@@ -140,12 +146,15 @@ records, restart policies, and captured logs now persist under
 running when the daemon stopped cannot be adopted, so it is reported exited
 (255) and restarted fresh only when its restart policy says so; the helper is
 tied to the daemon, so a crash tears down its PID namespace. Captured logs
-replay the newest 4 MiB into the serving ring.
+replay the newest 4 MiB into the serving ring. Static serving is intentionally
+minimal: no SPA fallback, range requests, compression, cache validators, CORS,
+or auth, and Docker namespaces are reserved.
 
 Exit criterion partially met: curl/Docker-CLI container lifecycle and image
 pull/list/inspect/tag/delete/save/load work over HTTP, the version-gate
-matrix is green, and error payloads use upstream message conventions. Full
-endpoint and error-payload conformance is milestone L.
+matrix is green, same-origin console smoke tests pass, and error payloads use
+upstream message conventions. Full endpoint and error-payload conformance is
+milestone L.
 
 ## H/I — Builder (`docker-buildkit`)
 Dockerfile frontend: instruction parsing → DAG (LLB-equivalent) →

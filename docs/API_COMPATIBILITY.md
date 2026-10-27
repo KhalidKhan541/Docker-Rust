@@ -19,8 +19,8 @@ MinSupportedAPIVersion = "1.24"
   the server supports receives a `versionUnsupportedError`, not newer
   behavior.
 
-docker-rs will implement the identical gate (milestone F): accept `v1.24`
-through `v1.51`, reject lower/unknown with a structured error, and set
+docker-rs implements the identical gate: it accepts `v1.24` through `v1.51`,
+rejects lower/unknown versions with a structured error, and sets
 `Api-Version` on every response.
 
 ## Wire shapes already implemented and pinned by tests
@@ -160,6 +160,46 @@ position; `until` alone replays the buffered window up to that time, matching
 Moby's zero-time rule. A slow subscriber is disconnected/dropped by the
 broker; the stream uses chunked transfer encoding.
 
+### Static console serving (docker-rs extension)
+
+`docker-rsd --web-root <dir>` serves a local console or static site from the
+same TCP listener as the Engine API. This is deliberately **not** a Docker
+Engine endpoint and clients should not depend on it.
+
+**Route precedence.** The static handler runs only after the API router has
+declined a path. All `/vX.Y/...` paths and these top-level namespaces are
+reserved for the API, even when the endpoint is unimplemented:
+
+`/_ping`, `/auth`, `/build`, `/commit`, `/configs`, `/containers`,
+`/distribution`, `/events`, `/exec`, `/images`, `/info`, `/networks`,
+`/nodes`, `/plugins`, `/secrets`, `/services`, `/session`, `/swarm`,
+`/system`, `/tasks`, `/version`, `/volumes`.
+
+A file at `web/containers/json` can therefore never shadow
+`GET /containers/json`; an unimplemented namespace such as `/networks` stays
+an API 404 rather than serving a same-named page. Use a non-reserved path
+(such as `/assets/...`) for static assets.
+
+**Resolution.** Only `GET` and `HEAD` are served. `/` maps to `index.html`,
+an extensionless path such as `/console` maps to `console.html`, and a
+directory maps to its `index.html`. There is no directory listing or SPA
+fallback. An existing page requested with another method returns 405 with
+`Allow: GET, HEAD`; an unknown path returns the ordinary JSON 404.
+
+**Safety.** The root is canonicalized at startup and must be a directory.
+The URL path is percent-decoded exactly once; NUL/control characters,
+backslashes, colons, `..`, dot-prefixed segments, trailing dots/spaces, and
+Windows device names (`CON`, `NUL`, `COM1`, ...) are rejected. The resolved
+path must canonicalize to a regular file under the canonical root, so
+symlinks/junctions cannot escape it. Files larger than 64 MiB are rejected.
+Responses get `Cache-Control: no-cache` and
+`X-Content-Type-Options: nosniff`, plus a small extension-to-MIME map.
+
+There is no CORS support and no authentication/TLS. The console is intended
+to be opened from the daemon's own origin (for example
+`http://127.0.0.1:2375/console.html`). For remote access, put an
+authenticated TLS proxy in front of the daemon.
+
 ## Honest gaps in this slice
 
 - **Image management is not complete.** Push, prune, build, manifest
@@ -203,6 +243,12 @@ broker; the stream uses chunked transfer encoding.
 - **Transport is TCP only.** `npipe://` and `unix://` listeners are rejected
   explicitly by `docker-rsd`. Clients connect with
   `DOCKER_HOST=tcp://127.0.0.1:2375`.
+- **Static serving is intentionally minimal.** `--web-root` supports
+  GET/HEAD only, has no directory listing, SPA fallback, range requests,
+  compression, cache validators, CORS, or auth. Docker API namespaces and
+  `/vX.Y` prefixes are reserved and cannot be served from the web root. The
+  web root is trusted content: dotfiles and traversal are blocked, but any
+  other readable regular file under the canonical root can be downloaded.
 - **No authentication or TLS.** The default listener binds loopback; do not
   expose it to an untrusted network.
 - `/info` values that need image, network, cgroup, or kernel integrations are

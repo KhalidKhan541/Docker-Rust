@@ -11,9 +11,10 @@ specifications.
 real containers in materialized image rootfs on `ubuntu-latest` CI (this
 Windows host cannot run it locally); Milestone F/G has a runnable
 Docker-compatible container-lifecycle, image-management, image-save/load, and
-logs HTTP API with real registry pulls, persistent image metadata, and
-container records/logs that survive daemon restarts. Attach, exec, and process
-re-attachment across a daemon restart are still pending — see
+logs HTTP API with real registry pulls, persistent image metadata, container
+records/logs that survive daemon restarts, and an opt-in same-origin static
+console (`--web-root`). Attach, exec, and process re-attachment across a daemon
+restart are still pending — see
 [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).**
 
 ## Motivation and scope
@@ -68,13 +69,13 @@ Current milestone map:
   `/_ping`, `/version`, `/info`, container create/list/inspect/start/stop/
   restart/kill/wait/delete, image list/pull/inspect/history/tag/delete,
   image save/load (`/images/get`, `/images/{name}/get`, `/images/load`),
-  streaming `/events` with replay, `/containers/{id}/logs`, and a runnable
-  `docker-rsd` binary with a persistent image and container-record/log store.
-  Real registry pulls (multi-platform manifests, verified layers), Docker Hub,
-  Docker save/load archives, and the real Docker CLI v29.9.1 have been
-  exercised. It defaults
-  to the synthetic runtime; `--runtime oci` materializes image rootfs and
-  runs real containers (verified on `ubuntu-latest` CI). Container records,
+  streaming `/events` with replay, `/containers/{id}/logs`, an opt-in
+  same-origin console/static root (`--web-root`), and a runnable `docker-rsd`
+  binary with a persistent image and container-record/log store. Real registry
+  pulls (multi-platform manifests, verified layers), Docker Hub, Docker
+  save/load archives, and the real Docker CLI v29.9.1 have been exercised. It
+  defaults to the synthetic runtime; `--runtime oci` materializes image rootfs
+  and runs real containers (verified on `ubuntu-latest` CI). Container records,
   logs, and restart policies survive a daemon restart; a lost process is
   reported exited (255) and only restarted when its policy says so.
 * **H/I — Builder**, **J — CLI**, **K — Security hardening**,
@@ -123,6 +124,37 @@ runs the container through the built-in init helper. The native runtime
 requires root (rootless/user namespaces are not implemented yet) and a
 `docker-runtime-init` binary next to `docker-rsd`; `cargo build --workspace`
 produces both.
+
+### Serve the console from the daemon
+
+`--web-root <dir>` serves a local console and its assets from the same TCP
+listener as the Engine API:
+
+```bash
+cargo run -p docker-rsd -- \
+  --host 127.0.0.1:2375 \
+  --data-root ./docker-rs-data \
+  --web-root web
+# open http://127.0.0.1:2375/ or http://127.0.0.1:2375/console.html
+```
+
+The directory is canonicalized at startup and must be a directory; put
+`index.html` there for the landing page. A missing path or a regular file is
+rejected. API paths always win: every
+reserved Docker namespace (`/containers`, `/images`, `/events`,
+`/version`, ...) and every `/vX.Y/...` path is routed to the Engine API even
+when a file with the same name exists. For non-API paths the handler supports
+`GET`/`HEAD`, maps `/` to `index.html`, extensionless paths to `.html`, and
+directories to their `index.html`; there is no directory listing. It rejects
+traversal (including encoded traversal), dotfiles, backslashes, colons,
+Windows device names, and symlinks that resolve outside the canonical web
+root; only regular files are served, capped at 64 MiB. Responses use a small
+MIME map, `Cache-Control: no-cache`, and `X-Content-Type-Options: nosniff`.
+
+This is a docker-rs extension, not a Docker Engine endpoint. There is no CORS
+support: serve the console from the daemon so the UI and API share one origin.
+The listener still has no authentication or TLS; keep it on `127.0.0.1` unless
+an authenticated TLS proxy is in front of it.
 
 `--data-root` (or `DRC_DATA_ROOT`) selects the persistent image and container
 root: image metadata/blobs under `images/`, and one directory per container
@@ -186,10 +218,12 @@ crates/
                       boundary, persisted records/logs, synthetic runtime
   image-store/        persistent image index + verified-CAS blobs + registry pulls
                       + Docker/OCI save-load archives
-  api/                Docker Engine HTTP API (version gate, DTOs, routes, events)
+  api/                Docker Engine HTTP API (version gate, DTOs, routes, events),
+                      opt-in same-origin static console
   daemon-bin/         `docker-rsd` runnable Engine API daemon
 tests/
   integration/        cross-crate integration tests (A–D vertical slices)
+  *.sh                Linux runtime + same-origin console smoke tests
 docs/                 reverse-engineering + design + status documents
 upstream/             pinned original repositories (not tracked in git)
 ```
@@ -201,7 +235,8 @@ upstream/             pinned original repositories (not tracked in git)
   the in-process synthetic runtime and does not execute containers);
 * the F/G container API (`docker-rsd`) needs only the toolchain and a free
   TCP port; it defaults to the synthetic runtime and `--runtime oci` runs
-  real Linux containers;
+  real Linux containers; `--web-root` additionally needs a directory of
+  static files and a browser;
 * Milestone E native execution requires a Linux host with namespaces, mount
   privileges, and root (rootless/user namespaces are not implemented yet).
   It is verified on `ubuntu-latest` CI; this Windows host has no Linux
@@ -216,6 +251,8 @@ not yet drop capabilities or apply seccomp/LSM policy, and bridge networking,
 cgroups, TTY, and user namespaces return `Unsupported`. Do not treat
 Milestone E as hardened isolation (Milestone K). The F/G API listener is
 currently plain TCP with no authentication or TLS; keep it on loopback.
+`--web-root` serves files from that same unauthenticated listener; it does not
+add auth or CORS, and its API namespaces remain reserved.
 
 ## License
 
