@@ -28,6 +28,9 @@ use unsupported::create_task;
 /// installations and for tests that build the helper in a target directory.
 pub const RUNTIME_INIT_ENV: &str = "DOCKER_RS_RUNTIME_INIT";
 
+/// Environment override for the namespace-entering exec helper.
+pub const RUNTIME_EXEC_ENV: &str = "DOCKER_RS_RUNTIME_EXEC";
+
 /// Native OCI runtime. Bundle generation is portable; process execution is
 /// currently implemented only on Linux.
 #[derive(Clone)]
@@ -35,6 +38,8 @@ pub struct OciRuntime {
     pub(crate) state_root: PathBuf,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) init_program: Option<PathBuf>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) exec_program: Option<PathBuf>,
     pub(crate) capture_stdio: bool,
     pub(crate) rootfs_provider: Option<Arc<dyn RootfsProvider>>,
 }
@@ -45,6 +50,7 @@ impl fmt::Debug for OciRuntime {
             .debug_struct("OciRuntime")
             .field("state_root", &self.state_root)
             .field("init_program", &self.init_program)
+            .field("exec_program", &self.exec_program)
             .field("capture_stdio", &self.capture_stdio)
             .field("has_rootfs_provider", &self.rootfs_provider.is_some())
             .finish()
@@ -57,6 +63,7 @@ impl OciRuntime {
         Self {
             state_root: state_root.into(),
             init_program: None,
+            exec_program: None,
             capture_stdio: false,
             rootfs_provider: None,
         }
@@ -73,6 +80,13 @@ impl OciRuntime {
     /// current executable.
     pub fn with_init_program(mut self, program: impl Into<PathBuf>) -> Self {
         self.init_program = Some(program.into());
+        self
+    }
+
+    /// Override the exec helper path. By default the helper is resolved next
+    /// to the init helper, then next to the daemon executable.
+    pub fn with_exec_program(mut self, program: impl Into<PathBuf>) -> Self {
+        self.exec_program = Some(program.into());
         self
     }
 
@@ -137,6 +151,56 @@ impl OciRuntime {
         )))
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn resolve_exec_program(&self) -> Result<PathBuf> {
+        if let Some(program) = &self.exec_program {
+            if program.is_file() {
+                return Ok(program.clone());
+            }
+            return Err(Error::unavailable(format!(
+                "runtime exec helper `{}` does not exist",
+                program.display()
+            )));
+        }
+        if let Ok(value) = std::env::var(RUNTIME_EXEC_ENV) {
+            let program = PathBuf::from(value);
+            if program.is_file() {
+                return Ok(program);
+            }
+            return Err(Error::unavailable(format!(
+                "{RUNTIME_EXEC_ENV} points at `{}`, which is not a file",
+                program.display()
+            )));
+        }
+
+        let name = if cfg!(windows) {
+            "docker-runtime-exec.exe"
+        } else {
+            "docker-runtime-exec"
+        };
+        let init = self.resolve_init_program()?;
+        let sibling = init.with_file_name(name);
+        if sibling.is_file() {
+            return Ok(sibling);
+        }
+        let current = std::env::current_exe().map_err(|err| {
+            Error::internal(format!(
+                "locating current executable for runtime exec: {err}"
+            ))
+        })?;
+        if let Some(parent) = current.parent() {
+            for candidate in [parent.join(name), parent.join("..").join(name)] {
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
+            }
+        }
+        Err(Error::unavailable(format!(
+            "runtime exec helper `{name}` was not found next to the init helper `{}`; set {RUNTIME_EXEC_ENV}",
+            init.display()
+        )))
+    }
+
     /// Verify the host can execute native tasks before the daemon starts
     /// serving requests. This reports unsupported hosts and missing
     /// privileges up front instead of failing on the first `start`.
@@ -144,6 +208,7 @@ impl OciRuntime {
         #[cfg(target_os = "linux")]
         {
             self.resolve_init_program()?;
+            self.resolve_exec_program()?;
             if !nix::unistd::Uid::effective().is_root() {
                 return Err(Error::permission_denied(
                     "the native OCI runtime requires root (or a privileged user namespace, which is not implemented yet); \

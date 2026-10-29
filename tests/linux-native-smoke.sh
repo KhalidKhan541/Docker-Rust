@@ -55,6 +55,27 @@ message:
 EOF
 cc -nostdlib -static -no-pie -o "$WORK/probe" "$WORK/probe.S"
 
+# Static exec probe that prints a marker and exits 7, so `docker exec` can be
+# checked for both output delivery and exit-code propagation through inspect.
+cat >"$WORK/exit7.S" <<'EOF'
+.global _start
+.section .text
+_start:
+    mov $1, %rax
+    mov $1, %rdi
+    lea message(%rip), %rsi
+    mov $message_len, %rdx
+    syscall
+    mov $60, %rax
+    mov $7, %rdi
+    syscall
+.section .rodata
+message:
+    .ascii "exec-exit-ok\n"
+.set message_len, . - message
+EOF
+cc -nostdlib -static -no-pie -o "$WORK/exit7" "$WORK/exit7.S"
+
 # A static process that sleeps until killed, used to verify that a daemon
 # crash tears down the container PID namespace instead of orphaning it. It is
 # run as uid/gid 1000 so the credential change clears PR_SET_PDEATHSIG and the
@@ -71,9 +92,10 @@ cc -nostdlib -static -no-pie -o "$WORK/rs-sleeper" "$WORK/rs-sleeper.S"
 
 mkdir -p "$WORK/layer"
 cp "$WORK/probe" "$WORK/layer/probe"
+cp "$WORK/exit7" "$WORK/layer/exit7"
 cp "$WORK/rs-sleeper" "$WORK/layer/rs-sleeper"
-chmod 0755 "$WORK/layer/probe" "$WORK/layer/rs-sleeper"
-tar -C "$WORK/layer" -cf "$WORK/layer.tar" probe rs-sleeper
+chmod 0755 "$WORK/layer/probe" "$WORK/layer/exit7" "$WORK/layer/rs-sleeper"
+tar -C "$WORK/layer" -cf "$WORK/layer.tar" probe exit7 rs-sleeper
 gzip -n -c "$WORK/layer.tar" >"$WORK/layer.tar.gz"
 
 layer_digest="sha256:$(sha256sum "$WORK/layer.tar.gz" | cut -d' ' -f1)"
@@ -169,6 +191,29 @@ if [ "$seen" -ne 1 ]; then
     exit 1
 fi
 
+# Exercise the exact client path that motivated attach: `docker run` without
+# `-d` attaches before starting, then expects the server to hand it a
+# multiplexed stdcopy stream. The GitHub runner ships a Docker CLI even though
+# its daemon is separate; DOCKER_HOST points the CLI at this test daemon.
+if command -v docker >/dev/null 2>&1; then
+    if ! DOCKER_HOST="tcp://127.0.0.1:$PORT" DOCKER_API_VERSION=1.51 \
+        timeout 60 docker run --name attach-probe --network none probe:latest \
+        >"$WORK/attach.out" 2>"$WORK/attach.err"; then
+        cat "$WORK/attach.out" >&2
+        cat "$WORK/attach.err" >&2
+        echo "linux-native-smoke: foreground docker run failed" >&2
+        exit 1
+    fi
+    if ! grep -aq "native-runtime-ok" "$WORK/attach.out"; then
+        cat "$WORK/attach.out" >&2
+        cat "$WORK/attach.err" >&2
+        echo "linux-native-smoke: foreground docker run did not receive probe output" >&2
+        exit 1
+    fi
+else
+    echo "linux-native-smoke: docker CLI not found; skipping foreground client check" >&2
+fi
+
 # Start a long-running container as a non-root user, then crash the daemon.
 # The init helper must die with it (parent-death signal, re-armed after the
 # credential change), taking the container PID namespace down so the next
@@ -198,6 +243,43 @@ if [ "$sleeper_state" != "running" ] || [ "$sleeper_seen" -ne 1 ]; then
     echo "linux-native-smoke: long-running container did not start (state=$sleeper_state)" >&2
     curl -fsS "http://127.0.0.1:$PORT/containers/sleeper/logs?stdout=1&stderr=1" >&2 || true
     exit 1
+fi
+
+# Exercise `docker exec` through the real CLI. The exec helper joins the
+# running container's namespaces and chroots before spawning the command, so
+# this verifies output multiplexing and, with /exit7, that the CLI receives the
+# exec process's exit code through the inspect endpoint.
+if command -v docker >/dev/null 2>&1; then
+    if ! exec_output=$(DOCKER_HOST="tcp://127.0.0.1:$PORT" DOCKER_API_VERSION=1.51 \
+        timeout 60 docker exec --user 1000:1000 sleeper /probe); then
+        echo "linux-native-smoke: docker exec failed" >&2
+        exit 1
+    fi
+    if [ "$exec_output" != "native-runtime-ok" ]; then
+        echo "linux-native-smoke: docker exec did not deliver probe output (got '$exec_output')" >&2
+        exit 1
+    fi
+
+    set +e
+    DOCKER_HOST="tcp://127.0.0.1:$PORT" DOCKER_API_VERSION=1.51 \
+        timeout 60 docker exec sleeper /exit7 \
+        >"$WORK/exec-exit.out" 2>"$WORK/exec-exit.err"
+    exec_status=$?
+    set -e
+    if [ "$exec_status" -ne 7 ]; then
+        cat "$WORK/exec-exit.out" >&2
+        cat "$WORK/exec-exit.err" >&2
+        echo "linux-native-smoke: docker exec returned $exec_status, expected 7" >&2
+        exit 1
+    fi
+    if ! grep -aq "exec-exit-ok" "$WORK/exec-exit.out"; then
+        cat "$WORK/exec-exit.out" >&2
+        cat "$WORK/exec-exit.err" >&2
+        echo "linux-native-smoke: docker exec did not deliver exit7 output" >&2
+        exit 1
+    fi
+else
+    echo "linux-native-smoke: docker CLI not found; skipping docker exec checks" >&2
 fi
 
 kill -9 "$DAEMON_PID" 2>/dev/null || true

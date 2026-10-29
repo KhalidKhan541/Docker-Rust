@@ -6,6 +6,7 @@
 //! with OCI tasks is exercised here. Behaviour is controlled per runtime
 //! instance and recorded so tests can assert create/start/kill/delete calls.
 
+use std::io::Cursor;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,7 +14,7 @@ use docker_common::ContainerId;
 use docker_container_model::config::Signal;
 use docker_errors::{Error, Result};
 
-use crate::runtime::{ExitStatus, Runtime, RuntimeConfig, RuntimeTask};
+use crate::runtime::{ExecConfig, ExitStatus, Runtime, RuntimeConfig, RuntimeTask, StdioHandles};
 
 /// Scripted task behaviour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,10 +107,41 @@ impl SyntheticBehavior {
 #[derive(Debug, Default)]
 struct SyntheticInner {
     behavior: SyntheticBehavior,
+    exec_behavior: Option<SyntheticExecBehavior>,
     created: Vec<ContainerId>,
     started: Vec<ContainerId>,
     kills: Vec<(ContainerId, Signal)>,
     deleted: usize,
+}
+
+/// Scripted output and exit status for a synthetic `exec` task.
+///
+/// The production daemon leaves this unset, so the synthetic runtime continues
+/// to reject exec explicitly. Tests opt in to exercise the API and actor state
+/// machine without a Linux namespace environment.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyntheticExecBehavior {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub exit_code: i32,
+    /// `None` keeps the exec running until it is killed.
+    pub exit_after: Option<Duration>,
+}
+
+impl SyntheticExecBehavior {
+    /// Emit the given streams and exit immediately with `exit_code`.
+    pub fn immediate(
+        stdout: impl Into<Vec<u8>>,
+        stderr: impl Into<Vec<u8>>,
+        exit_code: i32,
+    ) -> Self {
+        Self {
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            exit_code,
+            exit_after: Some(Duration::ZERO),
+        }
+    }
 }
 
 /// Scripted runtime. Cloneable handles share observation state.
@@ -148,6 +180,20 @@ impl SyntheticRuntime {
             .behavior = behavior;
     }
 
+    /// Enable scripted `exec` support. Without this, `RuntimeTask::exec`
+    /// returns `Unsupported` like the production synthetic runtime.
+    pub fn with_exec_behavior(self, behavior: SyntheticExecBehavior) -> Self {
+        self.set_exec_behavior(behavior);
+        self
+    }
+
+    pub fn set_exec_behavior(&self, behavior: SyntheticExecBehavior) {
+        self.inner
+            .lock()
+            .expect("synthetic runtime lock poisoned")
+            .exec_behavior = Some(behavior);
+    }
+
     pub fn created(&self) -> Vec<ContainerId> {
         self.inner
             .lock()
@@ -184,6 +230,14 @@ impl SyntheticRuntime {
             .lock()
             .expect("synthetic runtime lock poisoned")
             .behavior
+    }
+
+    fn exec_behavior(&self) -> Option<SyntheticExecBehavior> {
+        self.inner
+            .lock()
+            .expect("synthetic runtime lock poisoned")
+            .exec_behavior
+            .clone()
     }
 
     fn record_start(&self, id: &ContainerId) {
@@ -340,5 +394,146 @@ impl RuntimeTask for SyntheticTask {
             self.runtime.record_delete();
         }
         Ok(())
+    }
+
+    fn exec(&self, config: &ExecConfig) -> Result<Box<dyn RuntimeTask>> {
+        if config.argv.is_empty() {
+            return Err(Error::invalid_argument("exec argv must not be empty"));
+        }
+        let behavior = self.runtime.exec_behavior().ok_or_else(|| {
+            Error::unsupported("exec is not implemented by this synthetic runtime")
+        })?;
+        let (lock, _) = &*self.state;
+        let inner = lock.lock().expect("synthetic task lock poisoned");
+        if inner.deleted {
+            return Err(Error::conflict("synthetic task was deleted"));
+        }
+        if inner.started_at.is_none() {
+            return Err(Error::conflict("synthetic task has not been started"));
+        }
+        if inner.exit.is_some() {
+            return Err(Error::conflict("synthetic task has already exited"));
+        }
+        drop(inner);
+        Ok(Box::new(SyntheticExecTask::new(
+            behavior,
+            config.capture_stdio,
+        )))
+    }
+}
+
+#[derive(Debug)]
+struct ExecInner {
+    started_at: Option<Instant>,
+    exit: Option<ExitStatus>,
+    deleted: bool,
+    stdio_taken: bool,
+}
+
+#[derive(Debug)]
+struct SyntheticExecTask {
+    behavior: SyntheticExecBehavior,
+    capture_stdio: bool,
+    state: Arc<(Mutex<ExecInner>, Condvar)>,
+}
+
+impl SyntheticExecTask {
+    fn new(behavior: SyntheticExecBehavior, capture_stdio: bool) -> Self {
+        Self {
+            behavior,
+            capture_stdio,
+            state: Arc::new((
+                Mutex::new(ExecInner {
+                    started_at: None,
+                    exit: None,
+                    deleted: false,
+                    stdio_taken: false,
+                }),
+                Condvar::new(),
+            )),
+        }
+    }
+
+    fn natural_exit(&self) -> ExitStatus {
+        ExitStatus::from_code(self.behavior.exit_code)
+    }
+}
+
+impl RuntimeTask for SyntheticExecTask {
+    fn start(&self) -> Result<()> {
+        let (lock, cv) = &*self.state;
+        let mut inner = lock.lock().expect("synthetic exec lock poisoned");
+        if inner.deleted {
+            return Err(Error::conflict("synthetic exec was deleted"));
+        }
+        if inner.started_at.is_some() {
+            return Err(Error::conflict("synthetic exec already started"));
+        }
+        inner.started_at = Some(Instant::now());
+        cv.notify_all();
+        Ok(())
+    }
+
+    fn wait(&self) -> Result<ExitStatus> {
+        let (lock, cv) = &*self.state;
+        let mut inner = lock.lock().expect("synthetic exec lock poisoned");
+        loop {
+            if let Some(exit) = &inner.exit {
+                return Ok(exit.clone());
+            }
+            let Some(started_at) = inner.started_at else {
+                return Err(Error::unavailable("synthetic exec was not started"));
+            };
+            if let Some(after) = self.behavior.exit_after {
+                let deadline = started_at + after;
+                let now = Instant::now();
+                if now >= deadline {
+                    let exit = self.natural_exit();
+                    inner.exit = Some(exit.clone());
+                    cv.notify_all();
+                    return Ok(exit);
+                }
+                let (guard, _) = cv
+                    .wait_timeout(inner, deadline - now)
+                    .expect("synthetic exec lock poisoned");
+                inner = guard;
+            } else {
+                inner = cv.wait(inner).expect("synthetic exec lock poisoned");
+            }
+        }
+    }
+
+    fn kill(&self, signal: Signal) -> Result<()> {
+        let (lock, cv) = &*self.state;
+        let mut inner = lock.lock().expect("synthetic exec lock poisoned");
+        if inner.exit.is_none() {
+            inner.exit = Some(ExitStatus {
+                exit_code: 128 + signal.number(),
+                signal: Some(signal),
+            });
+            cv.notify_all();
+        }
+        Ok(())
+    }
+
+    fn delete(&self) -> Result<()> {
+        let (lock, _) = &*self.state;
+        let mut inner = lock.lock().expect("synthetic exec lock poisoned");
+        inner.deleted = true;
+        Ok(())
+    }
+
+    fn take_stdio(&self) -> Result<Option<StdioHandles>> {
+        let (lock, _) = &*self.state;
+        let mut inner = lock.lock().expect("synthetic exec lock poisoned");
+        if !self.capture_stdio || inner.stdio_taken {
+            return Ok(None);
+        }
+        inner.stdio_taken = true;
+        Ok(Some(StdioHandles {
+            stdin: None,
+            stdout: Some(Box::new(Cursor::new(self.behavior.stdout.clone()))),
+            stderr: Some(Box::new(Cursor::new(self.behavior.stderr.clone()))),
+        }))
     }
 }

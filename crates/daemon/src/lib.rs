@@ -23,8 +23,11 @@ pub mod restart;
 pub mod runtime;
 pub mod synthetic;
 
-pub use engine::{ContainerView, CreateRequest, Daemon};
+pub use engine::{
+    ContainerView, CreateRequest, Daemon, ExecConfig, ExecProcessConfig, ExecSession, ExecView,
+    WaitCondition, WaitOutcome,
+};
 pub use logs::{LogEntry, LogStore, Stream, WriterLease};
 pub use restart::{RestartDecision, RestartManager};
 pub use runtime::{ExitStatus, Runtime, RuntimeConfig, RuntimeTask};
-pub use synthetic::{SyntheticBehavior, SyntheticRuntime};
+pub use synthetic::{SyntheticBehavior, SyntheticExecBehavior, SyntheticRuntime};

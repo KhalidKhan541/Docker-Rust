@@ -26,12 +26,15 @@ use docker_container_model::state::{validate_transition, LifecycleState, StateSn
 use docker_container_model::store::{ContainerFilter, ContainerRecord, ContainerStore};
 use docker_errors::{Error, Result};
 use docker_events::{event_now, Actor, EventAction, EventBroker, EventType, KnownAction};
+use docker_runtime::bundle::{replace_or_append_env, DEFAULT_PATH_ENV};
 use serde::Serialize;
 
 use crate::logs::{LogStore, Stream, DEFAULT_LOG_CAPACITY};
 use crate::persist::{ContainerDir, RestoredContainer};
 use crate::restart::RestartManager;
-use crate::runtime::{ExitStatus, Runtime, RuntimeConfig, RuntimeTask};
+use crate::runtime::{
+    ExecConfig as RuntimeExecConfig, ExitStatus, Runtime, RuntimeConfig, RuntimeTask,
+};
 
 /// Grace period between the escalated SIGKILL and declaring the runtime
 /// unresponsive. Mirrors the force-kill wait in `daemon/kill.go`.
@@ -112,6 +115,91 @@ impl ContainerView {
             restart_count,
         }
     }
+}
+
+/// `condition` accepted by `GET/POST /containers/{id}/wait`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitCondition {
+    /// Return as soon as the container is not running (the historical Moby
+    /// default). A created container is already "not running".
+    NotRunning,
+    /// Wait for the next process exit, including an exit that is followed by
+    /// a restart-policy restart. If the container has already exited, return
+    /// its current exit status immediately.
+    NextExit,
+    /// Wait until the container record has been removed.
+    Removed,
+}
+
+/// Result of a wait request. `StatusCode` mirrors Moby's `WaitResponse`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitOutcome {
+    pub status_code: i32,
+}
+
+/// A request to create an exec instance for a running container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecConfig {
+    pub command: Vec<String>,
+    pub env: Vec<String>,
+    pub working_dir: Option<String>,
+    pub user: Option<String>,
+    pub attach_stdin: bool,
+    pub attach_stdout: bool,
+    pub attach_stderr: bool,
+    pub tty: bool,
+    pub privileged: bool,
+}
+
+impl ExecConfig {
+    pub fn new(command: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            command: command.into_iter().map(Into::into).collect(),
+            env: Vec::new(),
+            working_dir: None,
+            user: None,
+            attach_stdin: false,
+            attach_stdout: true,
+            attach_stderr: true,
+            tty: false,
+            privileged: false,
+        }
+    }
+}
+
+/// Public projection of an exec instance, matching the fields consumed by
+/// `docker exec` and `GET /exec/{id}/json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecView {
+    pub id: String,
+    pub container_id: ContainerId,
+    pub started: bool,
+    pub running: bool,
+    pub exit_code: i32,
+    pub pid: i32,
+    pub process_config: ExecProcessConfig,
+    pub open_stdin: bool,
+    pub open_stdout: bool,
+    pub open_stderr: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecProcessConfig {
+    pub entrypoint: String,
+    pub arguments: Vec<String>,
+    pub user: String,
+    pub tty: bool,
+    pub privileged: bool,
+}
+
+/// An exec process started and captured by the actor. The API layer can
+/// stream `logs` without holding actor state; `open_*` comes from the create
+/// request so stdout/stderr filtering matches the client's attach options.
+#[derive(Debug, Clone)]
+pub struct ExecSession {
+    pub logs: Arc<LogStore>,
+    pub open_stdout: bool,
+    pub open_stderr: bool,
 }
 
 /// Public handle to the daemon actor.
@@ -233,6 +321,15 @@ impl Daemon {
         })
     }
 
+    /// Block until the requested container wait condition is satisfied.
+    pub fn wait(&self, reference: &str, condition: WaitCondition) -> Result<WaitOutcome> {
+        self.call(|reply| Command::Wait {
+            reference: reference.to_string(),
+            condition,
+            reply,
+        })
+    }
+
     pub fn list(&self, filters: &[ContainerFilter]) -> Result<Vec<ContainerView>> {
         self.call(|reply| Command::List {
             filters: filters.to_vec(),
@@ -247,6 +344,32 @@ impl Daemon {
     pub fn log_store(&self, reference: &str) -> Result<Option<Arc<LogStore>>> {
         self.call(|reply| Command::Logs {
             reference: reference.to_string(),
+            reply,
+        })
+    }
+
+    /// Create an exec configuration. The process does not start until
+    /// [`Daemon::exec_start`].
+    pub fn exec_create(&self, reference: &str, config: ExecConfig) -> Result<ExecView> {
+        self.call(|reply| Command::ExecCreate {
+            reference: reference.to_string(),
+            config: Box::new(config),
+            reply,
+        })
+    }
+
+    /// Start an exec instance and return its captured output stream. The
+    /// actor owns the process and updates the exit code asynchronously.
+    pub fn exec_start(&self, id: &str) -> Result<ExecSession> {
+        self.call(|reply| Command::ExecStart {
+            id: id.to_string(),
+            reply,
+        })
+    }
+
+    pub fn exec_inspect(&self, id: &str) -> Result<ExecView> {
+        self.call(|reply| Command::ExecInspect {
+            id: id.to_string(),
             reply,
         })
     }
@@ -314,6 +437,11 @@ enum Command {
         reference: String,
         reply: Sender<Result<ContainerView>>,
     },
+    Wait {
+        reference: String,
+        condition: WaitCondition,
+        reply: Sender<Result<WaitOutcome>>,
+    },
     List {
         filters: Vec<ContainerFilter>,
         reply: Sender<Result<Vec<ContainerView>>>,
@@ -321,6 +449,27 @@ enum Command {
     Logs {
         reference: String,
         reply: Sender<Result<Option<Arc<LogStore>>>>,
+    },
+    ExecCreate {
+        reference: String,
+        config: Box<ExecConfig>,
+        reply: Sender<Result<ExecView>>,
+    },
+    ExecStart {
+        id: String,
+        reply: Sender<Result<ExecSession>>,
+    },
+    ExecInspect {
+        id: String,
+        reply: Sender<Result<ExecView>>,
+    },
+    ExecExited {
+        id: String,
+        result: Result<ExitStatus>,
+        /// Acknowledges that the actor published the exit code. The monitor
+        /// holds the log writer lease until this arrives so an attach EOF
+        /// can never race ahead of `ExecInspect`.
+        acknowledged: Sender<()>,
     },
     TaskExited {
         id: ContainerId,
@@ -338,6 +487,8 @@ struct Meta {
     restart_count: u32,
     manually_stopped: bool,
     last_exit: Option<ExitStatus>,
+    /// Monotonic counter for wait clients using `condition=next-exit`.
+    exit_sequence: u64,
     /// Captured stdio ring buffer; lives for the whole container lifetime and
     /// accumulates across restarts like Moby's json-file log driver.
     logs: Arc<LogStore>,
@@ -350,6 +501,7 @@ impl Meta {
             restart_count: 0,
             manually_stopped: false,
             last_exit: None,
+            exit_sequence: 0,
             logs,
         }
     }
@@ -359,6 +511,76 @@ struct ActiveTask {
     task: Arc<dyn RuntimeTask>,
     generation: u64,
     started_at: Instant,
+}
+
+struct ExecState {
+    container_id: ContainerId,
+    config: ExecConfig,
+    task: Option<Arc<dyn RuntimeTask>>,
+    logs: Option<Arc<LogStore>>,
+    started: bool,
+    running: bool,
+    exit_code: i32,
+    pid: i32,
+}
+
+/// A blocked `/wait` request. Waiters are held by the actor (not by the HTTP
+/// handler), so they survive restarts and are notified exactly once.
+struct Waiter {
+    condition: WaitCondition,
+    /// Exit counter observed when a next-exit waiter registered.
+    exit_sequence: u64,
+    reply: Sender<Result<WaitOutcome>>,
+}
+
+/// Exec user lookup is intentionally limited to numeric `UID[:GID]`. Validate
+/// at the API boundary so a named user is an explicit unsupported error rather
+/// than a helper failure after the exec has already started.
+fn validate_numeric_exec_user(value: &str) -> Result<()> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(());
+    }
+    let valid = match value.split_once(':') {
+        Some((uid, gid)) => {
+            !uid.is_empty()
+                && !gid.is_empty()
+                && uid.parse::<u32>().is_ok()
+                && gid.parse::<u32>().is_ok()
+        }
+        None => value.parse::<u32>().is_ok(),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::unsupported(format!(
+            "exec user `{value}` requires numeric UID[:GID]; name lookup is not implemented"
+        )))
+    }
+}
+
+fn exec_view(state: &ExecState) -> ExecView {
+    let mut command = state.config.command.iter();
+    let entrypoint = command.next().cloned().unwrap_or_default();
+    let arguments = command.cloned().collect();
+    ExecView {
+        id: String::new(),
+        container_id: state.container_id.clone(),
+        started: state.started,
+        running: state.running,
+        exit_code: state.exit_code,
+        pid: state.pid,
+        process_config: ExecProcessConfig {
+            entrypoint,
+            arguments,
+            user: state.config.user.clone().unwrap_or_default(),
+            tty: state.config.tty,
+            privileged: state.config.privileged,
+        },
+        open_stdin: state.config.attach_stdin,
+        open_stdout: state.config.attach_stdout,
+        open_stderr: state.config.attach_stderr,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,6 +607,8 @@ struct Engine {
     store: ContainerStore,
     meta: HashMap<ContainerId, Meta>,
     tasks: HashMap<ContainerId, ActiveTask>,
+    execs: HashMap<String, ExecState>,
+    waiters: HashMap<ContainerId, Vec<Waiter>>,
     pending_stops: HashMap<ContainerId, PendingStop>,
     pending_restarts: HashMap<ContainerId, Instant>,
     runtime: Arc<dyn Runtime>,
@@ -448,6 +672,8 @@ impl Engine {
             store,
             meta,
             tasks: HashMap::new(),
+            execs: HashMap::new(),
+            waiters: HashMap::new(),
             pending_stops: HashMap::new(),
             pending_restarts: HashMap::new(),
             runtime,
@@ -550,6 +776,11 @@ impl Engine {
                 let result = self.inspect(&reference);
                 let _ = reply.send(result);
             }
+            Command::Wait {
+                reference,
+                condition,
+                reply,
+            } => self.wait(&reference, condition, reply),
             Command::List { filters, reply } => {
                 let result = self.list(&filters);
                 let _ = reply.send(result);
@@ -557,6 +788,30 @@ impl Engine {
             Command::Logs { reference, reply } => {
                 let result = self.log_store(&reference);
                 let _ = reply.send(result);
+            }
+            Command::ExecCreate {
+                reference,
+                config,
+                reply,
+            } => {
+                let result = self.exec_create(&reference, *config);
+                let _ = reply.send(result);
+            }
+            Command::ExecStart { id, reply } => {
+                let result = self.exec_start(&id);
+                let _ = reply.send(result);
+            }
+            Command::ExecInspect { id, reply } => {
+                let result = self.exec_inspect(&id);
+                let _ = reply.send(result);
+            }
+            Command::ExecExited {
+                id,
+                result,
+                acknowledged,
+            } => {
+                self.exec_exited(&id, result);
+                let _ = acknowledged.send(());
             }
             Command::TaskExited {
                 id,
@@ -845,6 +1100,123 @@ impl Engine {
         Ok(ContainerView::from_record(record, restart_count))
     }
 
+    fn wait(
+        &mut self,
+        reference: &str,
+        condition: WaitCondition,
+        reply: Sender<Result<WaitOutcome>>,
+    ) {
+        let id = match self.resolve_id(reference) {
+            Ok(id) => id,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return;
+            }
+        };
+        let record = match self.store.get(&id) {
+            Ok(record) => record,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return;
+            }
+        };
+        let status = record.state.status;
+        let current_exit = record.state.exit_code.unwrap_or(0);
+        match condition {
+            WaitCondition::NotRunning if !status.is_alive() => {
+                let _ = reply.send(Ok(WaitOutcome {
+                    status_code: current_exit,
+                }));
+                return;
+            }
+            WaitCondition::NextExit if status == LifecycleState::Removing => {
+                let _ = reply.send(Err(Error::conflict("container is being removed")));
+                return;
+            }
+            _ => {}
+        }
+        let exit_sequence = self
+            .meta
+            .get(&id)
+            .map(|meta| meta.exit_sequence)
+            .unwrap_or(0);
+        self.waiters.entry(id).or_default().push(Waiter {
+            condition,
+            exit_sequence,
+            reply,
+        });
+    }
+
+    /// Fulfil all waiters for `id` matching the predicate. Other conditions
+    /// remain blocked until their own state transition.
+    fn fulfill_waiters(
+        &mut self,
+        id: &ContainerId,
+        should_notify: impl Fn(&Waiter) -> bool,
+        status_code: i32,
+    ) {
+        let Some(waiters) = self.waiters.remove(id) else {
+            return;
+        };
+        let mut remaining = Vec::new();
+        for waiter in waiters {
+            if should_notify(&waiter) {
+                let _ = waiter.reply.send(Ok(WaitOutcome { status_code }));
+            } else {
+                remaining.push(waiter);
+            }
+        }
+        if !remaining.is_empty() {
+            self.waiters.insert(id.clone(), remaining);
+        }
+    }
+
+    fn notify_next_exit(&mut self, id: &ContainerId, status_code: i32) {
+        let sequence = self
+            .meta
+            .get(id)
+            .map(|meta| meta.exit_sequence)
+            .unwrap_or(0);
+        self.fulfill_waiters(
+            id,
+            |waiter| waiter.condition == WaitCondition::NextExit && waiter.exit_sequence < sequence,
+            status_code,
+        );
+    }
+
+    fn notify_not_running(&mut self, id: &ContainerId, status_code: i32) {
+        self.fulfill_waiters(
+            id,
+            |waiter| waiter.condition == WaitCondition::NotRunning,
+            status_code,
+        );
+    }
+
+    /// Wake both terminal wait conditions after a transition that will never
+    /// produce another process exit (failed restart or an unresponsive stop).
+    /// A `next-exit` waiter that survived the last process exit is waiting for
+    /// a replacement task, so the terminal failure is its final outcome.
+    fn notify_terminal(&mut self, id: &ContainerId, status_code: i32) {
+        self.fulfill_waiters(
+            id,
+            |waiter| {
+                matches!(
+                    waiter.condition,
+                    WaitCondition::NextExit | WaitCondition::NotRunning
+                )
+            },
+            status_code,
+        );
+    }
+
+    fn notify_removed(&mut self, id: &ContainerId, status_code: i32) {
+        self.fulfill_waiters(
+            id,
+            |waiter| waiter.condition == WaitCondition::Removed,
+            status_code,
+        );
+    }
+
     fn list(&self, filters: &[ContainerFilter]) -> Result<Vec<ContainerView>> {
         let mut views: Vec<ContainerView> = self
             .store
@@ -873,6 +1245,237 @@ impl Engine {
     fn log_store(&mut self, reference: &str) -> Result<Option<Arc<LogStore>>> {
         let id = self.resolve_id(reference)?;
         Ok(self.meta.get(&id).map(|meta| Arc::clone(&meta.logs)))
+    }
+
+    fn exec_create(&mut self, reference: &str, mut config: ExecConfig) -> Result<ExecView> {
+        if config.command.is_empty() {
+            return Err(Error::invalid_argument("exec command must not be empty"));
+        }
+        if config.tty {
+            return Err(Error::unsupported(
+                "exec TTY allocation is not implemented; omit --tty/-t",
+            ));
+        }
+        if config.privileged {
+            return Err(Error::unsupported(
+                "privileged exec is not implemented; omit --privileged",
+            ));
+        }
+        if let Some(user) = &config.user {
+            validate_numeric_exec_user(user)?;
+        }
+        if config.attach_stdin {
+            return Err(Error::unsupported(
+                "exec stdin is not implemented; omit --interactive/-i",
+            ));
+        }
+        if config.user.as_deref() == Some("") {
+            config.user = None;
+        }
+        if let Some(dir) = &config.working_dir {
+            if dir.is_empty() {
+                config.working_dir = None;
+            } else if !dir.starts_with('/') {
+                return Err(Error::invalid_argument(format!(
+                    "exec working directory `{dir}` must be absolute"
+                )));
+            }
+        }
+        for entry in &config.env {
+            let valid = entry
+                .split_once('=')
+                .map(|(key, _)| !key.is_empty())
+                .unwrap_or(false);
+            if !valid {
+                return Err(Error::invalid_argument(format!(
+                    "exec environment entry `{entry}` must be KEY=VALUE"
+                )));
+            }
+        }
+
+        let container_id = self.resolve_id(reference)?;
+        let record = self.store.get(&container_id)?;
+        if record.state.status != LifecycleState::Running {
+            return Err(Error::conflict(format!(
+                "container {} is not running",
+                container_id.as_str()
+            )));
+        }
+        let id = docker_common::rng::generate_id()?;
+        let state = ExecState {
+            container_id,
+            config,
+            task: None,
+            logs: None,
+            started: false,
+            running: false,
+            exit_code: 0,
+            pid: 0,
+        };
+        let mut view = exec_view(&state);
+        view.id = id.clone();
+        self.execs.insert(id, state);
+        Ok(view)
+    }
+
+    fn exec_start(&mut self, id: &str) -> Result<ExecSession> {
+        let (container_id, config) = {
+            let state = self
+                .execs
+                .get(id)
+                .ok_or_else(|| Error::not_found(format!("no such exec: {id}")))?;
+            if state.started {
+                return Err(Error::conflict(format!(
+                    "exec instance {id} has already started"
+                )));
+            }
+            (state.container_id.clone(), state.config.clone())
+        };
+        let record = self.store.get(&container_id)?;
+        if record.state.status != LifecycleState::Running {
+            return Err(Error::conflict(format!(
+                "container {} is not running",
+                container_id.as_str()
+            )));
+        }
+        if let Some(user) = config
+            .user
+            .as_deref()
+            .or(record.config.user.as_deref())
+            .filter(|value| !value.trim().is_empty())
+        {
+            validate_numeric_exec_user(user)?;
+        }
+        let runtime_config = RuntimeExecConfig {
+            argv: config.command.clone(),
+            env: {
+                let mut env = replace_or_append_env(&record.config.env, &config.env);
+                if !env.iter().any(|entry| entry.starts_with("PATH=")) {
+                    env.push(format!("PATH={DEFAULT_PATH_ENV}"));
+                }
+                env
+            },
+            cwd: config
+                .working_dir
+                .clone()
+                .or_else(|| record.config.working_dir.clone())
+                .unwrap_or_else(|| "/".to_string()),
+            user: config.user.clone().or_else(|| record.config.user.clone()),
+            capture_stdio: true,
+        };
+        let active = self.tasks.get(&container_id).ok_or_else(|| {
+            Error::conflict(format!(
+                "container {} has no active runtime task",
+                container_id.as_str()
+            ))
+        })?;
+        let task_box = active.task.exec(&runtime_config)?;
+        task_box.start()?;
+        let task: Arc<dyn RuntimeTask> = Arc::from(task_box);
+        let logs = Arc::new(LogStore::new(DEFAULT_LOG_CAPACITY));
+        // Keep the stream open until the exit status has been published to the
+        // actor. Capture pipes can reach EOF before `wait()` returns; without
+        // this lease the client could see EOF and issue ExecInspect while the
+        // actor still reports the exec as running with a stale exit code.
+        let close_hold = logs.take_writer();
+        let handles = match task.take_stdio() {
+            Ok(handles) => handles,
+            Err(error) => {
+                let _ = task.kill(Signal::Sigkill);
+                let _ = task.delete();
+                return Err(error);
+            }
+        };
+        if let Some(mut stdio) = handles {
+            // Exec stdin is rejected at create; dropping the pipe keeps the
+            // child from waiting on a descriptor the daemon never feeds.
+            drop(stdio.stdin.take());
+            if let Some(stdout) = stdio.stdout.take() {
+                Self::spawn_pipe_capture(&container_id, &logs, stdout, Stream::Stdout);
+            }
+            if let Some(stderr) = stdio.stderr.take() {
+                Self::spawn_pipe_capture(&container_id, &logs, stderr, Stream::Stderr);
+            }
+        }
+
+        let pid = task.pid().unwrap_or(0);
+        let monitor_task = Arc::clone(&task);
+        let monitor_logs = Arc::clone(&logs);
+        let monitor_hold = close_hold;
+        let command_tx = self.command_tx.clone();
+        let exec_id = id.to_string();
+        let monitor = thread::Builder::new()
+            .name(format!("docker-exec-{id}"))
+            .spawn(move || {
+                let result = monitor_task.wait();
+                // Publish the exit code before waiting on capture EOF. The
+                // client inspects the exec immediately after the attach
+                // stream closes, so the actor must already know the status by
+                // then; the capture threads can still drain their final bytes.
+                let (acknowledged, ack_rx) = mpsc::channel();
+                let _ = command_tx.send(Command::ExecExited {
+                    id: exec_id,
+                    result,
+                    acknowledged,
+                });
+                // Wait until the actor has actually stored the exit code
+                // before releasing the log writer lease. Enqueueing alone
+                // does not order this event against a later ExecInspect, and
+                // an attach EOF must never expose a stale `ExitCode`.
+                let _ = ack_rx.recv();
+                drop(monitor_hold);
+                let _ = monitor_logs.wait_closed(Duration::from_secs(2));
+                let _ = monitor_task.delete();
+            });
+        if let Err(error) = monitor {
+            let _ = task.kill(Signal::Sigkill);
+            let _ = task.delete();
+            logs.close();
+            return Err(Error::internal(format!(
+                "cannot start exec monitor thread: {error}"
+            )));
+        }
+
+        let state = self
+            .execs
+            .get_mut(id)
+            .expect("exec instance exists while starting");
+        state.started = true;
+        state.running = true;
+        state.pid = pid;
+        state.logs = Some(Arc::clone(&logs));
+        state.task = Some(task);
+        Ok(ExecSession {
+            logs,
+            open_stdout: config.attach_stdout,
+            open_stderr: config.attach_stderr,
+        })
+    }
+
+    fn exec_inspect(&self, id: &str) -> Result<ExecView> {
+        let mut view = self
+            .execs
+            .get(id)
+            .map(exec_view)
+            .ok_or_else(|| Error::not_found(format!("no such exec: {id}")))?;
+        view.id = id.to_string();
+        Ok(view)
+    }
+
+    fn exec_exited(&mut self, id: &str, result: Result<ExitStatus>) {
+        let Some(state) = self.execs.get_mut(id) else {
+            return;
+        };
+        state.running = false;
+        state.pid = 0;
+        state.task = None;
+        match result {
+            Ok(status) => state.exit_code = status.exit_code,
+            Err(error) => {
+                tracing::warn!(exec = %id, error = %error, "exec wait failed");
+                state.exit_code = 255;
+            }
+        }
     }
 
     /// Drain one captured pipe into the container's log store. Each read
@@ -955,15 +1558,16 @@ impl Engine {
             logs.reopen();
             match task.take_stdio() {
                 Ok(Some(stdio)) => {
-                    // No attach layer yet: closing the writer end gives the
-                    // child EOF on stdin, matching detached (`-d`) semantics.
+                    // Attach is output-only and does not consume stdin, so
+                    // closing the writer end gives the child EOF and matches
+                    // detached (`-d`) semantics.
                     drop(stdio.stdin);
                     let mut pipes: Vec<(Box<dyn Read + Send>, Stream)> = Vec::new();
                     if let Some(stdout) = stdio.stdout {
-                        pipes.push((Box::new(stdout), Stream::Stdout));
+                        pipes.push((stdout, Stream::Stdout));
                     }
                     if let Some(stderr) = stdio.stderr {
-                        pipes.push((Box::new(stderr), Stream::Stderr));
+                        pipes.push((stderr, Stream::Stderr));
                     }
                     for (pipe, stream) in pipes {
                         Self::spawn_pipe_capture(id, &logs, pipe, stream);
@@ -1035,6 +1639,7 @@ impl Engine {
                 signal: None,
             });
         let _ = self.set_exit_state(id, LifecycleState::Exited, &exit);
+        self.notify_terminal(id, exit.exit_code);
         self.maybe_auto_remove(id);
     }
 
@@ -1119,9 +1724,12 @@ impl Engine {
         if let Some(meta) = self.meta.get_mut(id) {
             meta.manually_stopped = true;
             meta.restart_manager.cancel();
+            meta.exit_sequence = meta.exit_sequence.saturating_add(1);
         }
         self.set_exit_state(id, LifecycleState::Exited, &exit)?;
         self.emit_container(&record, KnownAction::Stop, &[]);
+        self.notify_next_exit(id, exit.exit_code);
+        self.notify_not_running(id, exit.exit_code);
         self.maybe_auto_remove(id);
         Ok(())
     }
@@ -1140,6 +1748,9 @@ impl Engine {
             return;
         };
         let duration = active.started_at.elapsed();
+        if let Some(meta) = self.meta.get_mut(id) {
+            meta.exit_sequence = meta.exit_sequence.saturating_add(1);
+        }
 
         // With no captured stdio (synthetic runtime, or capture failed) no
         // writer will ever flip the close signal; do it here so `docker logs
@@ -1152,13 +1763,18 @@ impl Engine {
         let exit = match result {
             Ok(exit) => exit,
             Err(error) => {
+                self.notify_next_exit(id, 255);
                 self.task_failed(id, duration, error);
+                self.notify_not_running(id, 255);
                 return;
             }
         };
         if let Some(meta) = self.meta.get_mut(id) {
             meta.last_exit = Some(exit.clone());
         }
+        // `next-exit` observes the process result even when a restart policy
+        // immediately starts a replacement task.
+        self.notify_next_exit(id, exit.exit_code);
 
         if let Some(pending) = self.pending_stops.remove(id) {
             let PendingStop { reply, kind, .. } = pending;
@@ -1169,6 +1785,7 @@ impl Engine {
 
         if self.shutting_down {
             let _ = self.set_exit_state(id, LifecycleState::Exited, &exit);
+            self.notify_not_running(id, exit.exit_code);
             return;
         }
 
@@ -1213,6 +1830,7 @@ impl Engine {
                     tracing::error!(container = %id.as_str(), error = %error, "cannot enter exited state");
                 }
                 self.emit_die(&record, &exit, duration);
+                self.notify_not_running(id, exit.exit_code);
                 self.maybe_auto_remove(id);
             }
             Err(error) => {
@@ -1225,6 +1843,7 @@ impl Engine {
                     tracing::error!(container = %id.as_str(), error = %state_error, "cannot enter exited state");
                 }
                 self.emit_die(&record, &exit, duration);
+                self.notify_not_running(id, exit.exit_code);
                 self.maybe_auto_remove(id);
             }
         }
@@ -1241,13 +1860,26 @@ impl Engine {
         self.set_exit_state(id, LifecycleState::Exited, exit)?;
         self.emit_die(&record, exit, duration);
         self.emit_container(&record, KnownAction::Stop, &[]);
+        // Restarting is considered alive by `not-running`, so only a final
+        // stop/remove satisfies that condition here. A restart publishes its
+        // replacement run or a terminal failure instead.
+        if kind != StopKind::Restart {
+            self.notify_not_running(id, exit.exit_code);
+        }
         match kind {
             StopKind::Stop => {
                 self.maybe_auto_remove(id);
                 Ok(())
             }
             StopKind::Restart => {
-                self.start_task(id, true)?;
+                if let Err(error) = self.start_task(id, true) {
+                    // The previous task already published its `next-exit`
+                    // outcome, but a waiter registered during the restart
+                    // window must not be stranded when the replacement fails
+                    // to start.
+                    self.notify_terminal(id, exit.exit_code);
+                    return Err(error);
+                }
                 let record = self.store.get(id)?.clone();
                 self.emit_container(&record, KnownAction::Restart, &[]);
                 Ok(())
@@ -1329,6 +1961,7 @@ impl Engine {
                     signal: None,
                 });
             let _ = self.set_exit_state(id, LifecycleState::Exited, &exit);
+            self.notify_terminal(id, exit.exit_code);
             self.maybe_auto_remove(id);
         }
     }
@@ -1384,6 +2017,7 @@ impl Engine {
                     signal: Some(Signal::Sigkill),
                 };
                 let _ = self.set_dead(id, &exit);
+                self.notify_terminal(id, exit.exit_code);
                 let _ = pending.reply.send(Err(Error::unavailable(format!(
                     "container {} did not exit after SIGKILL",
                     id.as_str()
@@ -1483,6 +2117,22 @@ impl Engine {
 
     fn remove_record(&mut self, id: &ContainerId) -> Result<()> {
         let record = self.store.get(id)?.clone();
+        let exec_ids: Vec<String> = self
+            .execs
+            .iter()
+            .filter(|(_, exec)| &exec.container_id == id)
+            .map(|(exec_id, _)| exec_id.clone())
+            .collect();
+        for exec_id in exec_ids {
+            if let Some(exec) = self.execs.remove(&exec_id) {
+                if let Some(task) = exec.task {
+                    let _ = task.kill(Signal::Sigkill);
+                }
+                if let Some(logs) = exec.logs {
+                    logs.close();
+                }
+            }
+        }
         self.runtime.cleanup(id)?;
         // Force-close the log store so any follower stream ends even if a
         // capture thread is still draining a lingering pipe. `close` also
@@ -1498,6 +2148,21 @@ impl Engine {
             dir.remove(id)?;
         }
         self.store.remove(id)?;
+        // A removed container can no longer produce a new exit. Wake waiters
+        // that were waiting for removal (and any not-running waiter that raced
+        // with a forced remove) with the last known status.
+        let status = self
+            .meta
+            .get(id)
+            .and_then(|meta| meta.last_exit.as_ref())
+            .map(|exit| exit.exit_code)
+            .or(record.state.exit_code)
+            .unwrap_or(0);
+        self.notify_removed(id, status);
+        self.notify_not_running(id, status);
+        // No next exit can occur after removal; drop those blocked replies
+        // rather than retaining waiters forever.
+        self.waiters.remove(id);
         self.meta.remove(id);
         self.tasks.remove(id);
         self.pending_restarts.remove(id);
@@ -1556,6 +2221,17 @@ impl Engine {
             }
         }
         self.tasks.clear();
+        // Exec helpers live in the host PID namespace and are not children of
+        // the container init. Kill them explicitly so daemon shutdown does not
+        // leave a command running after its container task was torn down.
+        for (_, exec) in self.execs.drain() {
+            if let Some(task) = exec.task {
+                let _ = task.kill(Signal::Sigkill);
+            }
+            if let Some(logs) = exec.logs {
+                logs.close();
+            }
+        }
         // Nothing should keep followers waiting after the daemon is gone.
         for meta in self.meta.values() {
             meta.logs.close();
@@ -1564,6 +2240,13 @@ impl Engine {
             let _ = pending
                 .reply
                 .send(Err(Error::unavailable("daemon is shutting down")));
+        }
+        for (_, waiters) in self.waiters.drain() {
+            for waiter in waiters {
+                let _ = waiter
+                    .reply
+                    .send(Err(Error::unavailable("daemon is shutting down")));
+            }
         }
         self.pending_restarts.clear();
     }

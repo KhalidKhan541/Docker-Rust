@@ -14,7 +14,7 @@ use docker_container_model::config::{
 };
 use docker_container_model::state::{LifecycleState, StateSnapshot};
 use docker_container_model::store::ContainerFilter;
-use docker_daemon::{ContainerView, CreateRequest};
+use docker_daemon::{ContainerView, CreateRequest, ExecConfig as DaemonExecConfig, ExecView};
 use docker_errors::{Error, Result};
 use docker_image::Image;
 use serde::{Deserialize, Serialize};
@@ -1105,6 +1105,171 @@ fn is_empty_json(value: Option<&Value>) -> bool {
         Value::String(value) => value.is_empty(),
         Value::Array(values) => values.is_empty(),
         Value::Object(map) => map.values().all(|value| is_empty_json(Some(value))),
+    }
+}
+
+/// `POST /containers/{id}/exec` body (`container.ExecCreateRequest`).
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExecCreateRequestDto {
+    #[serde(rename = "User")]
+    pub user: String,
+    #[serde(rename = "Privileged")]
+    pub privileged: bool,
+    #[serde(rename = "Tty")]
+    pub tty: bool,
+    #[serde(rename = "ConsoleSize")]
+    pub console_size: Option<[u64; 2]>,
+    #[serde(rename = "AttachStdin")]
+    pub attach_stdin: bool,
+    #[serde(rename = "AttachStderr")]
+    pub attach_stderr: bool,
+    #[serde(rename = "AttachStdout")]
+    pub attach_stdout: bool,
+    #[serde(rename = "DetachKeys")]
+    pub detach_keys: String,
+    // Go marshals a nil slice as `null`; the Docker CLI sends `Env:null`
+    // when no `--env` flags are present.
+    #[serde(rename = "Env")]
+    pub env: Option<Vec<String>>,
+    #[serde(rename = "WorkingDir")]
+    pub working_dir: String,
+    #[serde(rename = "Cmd")]
+    pub cmd: Option<Vec<String>>,
+    /// Deprecated in Moby and ignored; accepted for older clients.
+    #[serde(rename = "Detach")]
+    pub detach: bool,
+}
+
+impl ExecCreateRequestDto {
+    pub fn into_config(self) -> Result<DaemonExecConfig> {
+        if self.tty {
+            return Err(Error::unsupported(
+                "exec TTY allocation is not implemented; omit --tty/-t",
+            ));
+        }
+        if let Some([height, width]) = self.console_size {
+            if height != 0 || width != 0 {
+                return Err(Error::invalid_argument(
+                    "exec ConsoleSize requires TTY support, which is not implemented",
+                ));
+            }
+        }
+        // Detach keys only matter while stdin is attached. Exec stdin is
+        // rejected by the daemon, so accepting the field is safe and keeps
+        // non-interactive clients with a configured detach-key default working.
+        let command = self.cmd.unwrap_or_default();
+        if command.is_empty() {
+            return Err(Error::invalid_argument("exec command must not be empty"));
+        }
+        Ok(DaemonExecConfig {
+            command,
+            env: self.env.unwrap_or_default(),
+            working_dir: (!self.working_dir.is_empty()).then_some(self.working_dir),
+            user: (!self.user.is_empty()).then_some(self.user),
+            attach_stdin: self.attach_stdin,
+            attach_stdout: self.attach_stdout,
+            attach_stderr: self.attach_stderr,
+            tty: self.tty,
+            privileged: self.privileged,
+        })
+    }
+}
+
+/// `POST /exec/{id}/start` body (`container.ExecStartRequest`).
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExecStartRequestDto {
+    #[serde(rename = "Detach")]
+    pub detach: bool,
+    #[serde(rename = "Tty")]
+    pub tty: bool,
+    #[serde(rename = "ConsoleSize")]
+    pub console_size: Option<[u64; 2]>,
+}
+
+impl ExecStartRequestDto {
+    pub fn validate(&self) -> Result<()> {
+        if self.tty {
+            return Err(Error::unsupported(
+                "exec TTY allocation is not implemented; omit --tty/-t",
+            ));
+        }
+        if let Some([height, width]) = self.console_size {
+            if height != 0 || width != 0 {
+                return Err(Error::invalid_argument(
+                    "exec ConsoleSize requires TTY support, which is not implemented",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `GET /exec/{id}/json` response.
+#[derive(Debug, Serialize)]
+pub struct ExecInspectResponse {
+    #[serde(rename = "ID")]
+    pub id: String,
+    #[serde(rename = "Running")]
+    pub running: bool,
+    #[serde(rename = "ExitCode")]
+    pub exit_code: i32,
+    #[serde(rename = "ProcessConfig")]
+    pub process_config: ExecProcessConfigResponse,
+    #[serde(rename = "OpenStdin")]
+    pub open_stdin: bool,
+    #[serde(rename = "OpenStderr")]
+    pub open_stderr: bool,
+    #[serde(rename = "OpenStdout")]
+    pub open_stdout: bool,
+    #[serde(rename = "CanRemove")]
+    pub can_remove: bool,
+    #[serde(rename = "ContainerID")]
+    pub container_id: String,
+    #[serde(rename = "DetachKeys")]
+    pub detach_keys: Option<Vec<u8>>,
+    #[serde(rename = "Pid")]
+    pub pid: i32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExecProcessConfigResponse {
+    #[serde(rename = "tty")]
+    pub tty: bool,
+    #[serde(rename = "entrypoint")]
+    pub entrypoint: String,
+    #[serde(rename = "arguments")]
+    pub arguments: Vec<String>,
+    #[serde(rename = "privileged")]
+    pub privileged: bool,
+    #[serde(rename = "user")]
+    pub user: String,
+}
+
+impl From<docker_daemon::ExecView> for ExecInspectResponse {
+    fn from(view: ExecView) -> Self {
+        Self {
+            id: view.id,
+            running: view.running,
+            // Moby's wire type is an int, not nullable: a created or running
+            // exec reports 0 until an exit status is published.
+            exit_code: view.exit_code,
+            process_config: ExecProcessConfigResponse {
+                tty: view.process_config.tty,
+                entrypoint: view.process_config.entrypoint,
+                arguments: view.process_config.arguments,
+                privileged: view.process_config.privileged,
+                user: view.process_config.user,
+            },
+            open_stdin: view.open_stdin,
+            open_stderr: view.open_stderr,
+            open_stdout: view.open_stdout,
+            can_remove: !view.running,
+            container_id: view.container_id.as_str().to_string(),
+            detach_keys: None,
+            pid: view.pid,
+        }
     }
 }
 

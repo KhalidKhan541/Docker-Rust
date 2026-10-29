@@ -546,6 +546,20 @@ impl LogStore {
         self.state.lock().map(|state| state.closed).unwrap_or(true)
     }
 
+    /// Wait up to `timeout` for the store's writers to finish and the close
+    /// signal to be set. Exec monitors use this to publish the exit code only
+    /// after the attach stream is ready to drain its final bytes.
+    pub fn wait_closed(&self, timeout: Duration) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return true;
+        };
+        let (state, _) = self
+            .activity
+            .wait_timeout_while(state, timeout, |state| !state.closed)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.closed
+    }
+
     /// Total captured bytes still stored, across streams.
     pub fn byte_count(&self) -> usize {
         self.state.lock().map(|state| state.bytes).unwrap_or(0)

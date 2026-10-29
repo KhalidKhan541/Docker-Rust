@@ -20,11 +20,10 @@
 //! that do not expose streams keep the default implementation.
 
 use std::path::PathBuf;
-use std::process::{ChildStderr, ChildStdin, ChildStdout};
 
 use docker_common::{ContainerId, Digest};
 use docker_container_model::config::{ContainerConfig, HostConfig, Signal};
-use docker_errors::Result;
+use docker_errors::{Error, Result};
 
 /// Everything a runtime needs to create one task.
 #[derive(Debug, Clone)]
@@ -96,11 +95,10 @@ pub trait RootfsProvider: Send + Sync + 'static {
 }
 
 /// Pipes owned by the runtime until the attach layer claims them.
-#[derive(Debug)]
 pub struct StdioHandles {
-    pub stdin: Option<ChildStdin>,
-    pub stdout: Option<ChildStdout>,
-    pub stderr: Option<ChildStderr>,
+    pub stdin: Option<Box<dyn std::io::Write + Send>>,
+    pub stdout: Option<Box<dyn std::io::Read + Send>>,
+    pub stderr: Option<Box<dyn std::io::Read + Send>>,
 }
 
 impl StdioHandles {
@@ -143,6 +141,34 @@ impl ExitStatus {
     }
 }
 
+/// Configuration for a process started inside an existing container.
+///
+/// The runtime receives the fully merged environment and working directory;
+/// resolving image defaults and exec overrides is the daemon's job. TTY and
+/// stdin are intentionally absent until the runtime can implement them
+/// honestly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecConfig {
+    pub argv: Vec<String>,
+    pub env: Vec<String>,
+    pub cwd: String,
+    pub user: Option<String>,
+    /// Capture stdout/stderr so the daemon can attach to the exec process.
+    pub capture_stdio: bool,
+}
+
+impl ExecConfig {
+    pub fn new(argv: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            argv: argv.into_iter().map(Into::into).collect(),
+            env: Vec::new(),
+            cwd: "/".to_string(),
+            user: None,
+            capture_stdio: true,
+        }
+    }
+}
+
 /// Factory for tasks. Implementations must be usable from the daemon actor
 /// and from monitor threads.
 pub trait Runtime: Send + Sync + 'static {
@@ -167,5 +193,21 @@ pub trait RuntimeTask: Send + Sync {
     /// one caller can take them; later calls return `Ok(None)`.
     fn take_stdio(&self) -> Result<Option<StdioHandles>> {
         Ok(None)
+    }
+
+    /// Host PID of the task's current process, when the backend exposes one.
+    /// Used by inspects; it is not a handle that callers may signal directly.
+    fn pid(&self) -> Option<i32> {
+        None
+    }
+
+    /// Prepare a process that joins this running task's namespaces and
+    /// filesystem. Runtimes that cannot provide namespace entry must return
+    /// `Unsupported` rather than running the command on the host.
+    fn exec(&self, config: &ExecConfig) -> Result<Box<dyn RuntimeTask>> {
+        let _ = config;
+        Err(Error::unsupported(
+            "exec is not implemented by this runtime backend",
+        ))
     }
 }

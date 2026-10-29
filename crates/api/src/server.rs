@@ -28,9 +28,10 @@ use serde_json::Value;
 use tiny_http::{Header, Request, Response, StatusCode};
 
 use crate::dto::{
-    self, ContainerSummary, CreateResponse, ErrorResponse, InfoPlugins, InfoResponse,
-    InspectResponse, RuntimeInfo, SwarmInfo, VersionComponent, VersionPlatform, VersionResponse,
-    WaitResponse, MAX_BODY_BYTES,
+    self, ContainerSummary, CreateResponse, ErrorResponse, ExecCreateRequestDto,
+    ExecInspectResponse, ExecStartRequestDto, InfoPlugins, InfoResponse, InspectResponse,
+    RuntimeInfo, SwarmInfo, VersionComponent, VersionPlatform, VersionResponse, WaitResponse,
+    MAX_BODY_BYTES,
 };
 use crate::image_dto::{
     history_items, ImageDeleteItem, ImageInspectResponse, ImageLoadMessage, ImagePullMessage,
@@ -179,9 +180,13 @@ impl ApiServer {
     }
 
     fn handle_request(&self, mut request: Request) {
-        // Attach takes over the HTTP connection, so it has to be recognized
-        // before the ordinary request/Reply path, which still owns the request
-        // for its response.
+        // Attach and exec-start take over the HTTP connection. They therefore
+        // have to be recognized before the ordinary request/Reply path, which
+        // still owns the request for its response.
+        if self.is_exec_start_request(&request) {
+            self.handle_exec_start(request);
+            return;
+        }
         if self.is_attach_request(&request) {
             self.handle_attach(request);
             return;
@@ -270,6 +275,25 @@ impl ApiServer {
         matches!(segments.as_slice(), ["containers", _, "attach"])
     }
 
+    /// True for `POST /exec/{id}/start` when the API version is in range.
+    fn is_exec_start_request(&self, request: &Request) -> bool {
+        if request.method().as_str() != "POST" {
+            return false;
+        }
+        let url = request.url();
+        let path = url.split_once('?').map_or(url, |(path, _)| path);
+        let (requested, path) = version::split_version(path);
+        if !self.gate.check(requested).is_accepted() {
+            return false;
+        }
+        let segments: Vec<&str> = path
+            .trim_matches('/')
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        matches!(segments.as_slice(), ["exec", _, "start"])
+    }
+
     /// Engine `POST /containers/{id}/attach`.
     ///
     /// Output is sourced from the same lossless log store as `docker logs`,
@@ -336,6 +360,13 @@ impl ApiServer {
                 return;
             }
         };
+        // Attach-to-stopped is the first half of `docker start -a`: the CLI
+        // attaches before starting the container. A stopped store has its
+        // close signal set, so clear it for this follower; the next task exit
+        // (or removal/shutdown) closes the store again.
+        if options.stream && store.is_closed() {
+            store.reopen();
+        }
         let (replay, next) = attach_replay(&store, &options, stream);
         let entry_stream = EntryStream {
             store,
@@ -418,6 +449,132 @@ impl ApiServer {
         }
     }
 
+    /// Engine `POST /exec/{id}/start`.
+    ///
+    /// The exec implementation is output-only: stdin and TTY are rejected at
+    /// create time. A non-detached start replays and follows the exec's
+    /// captured log store, using the same stdcopy framing as attach. Detached
+    /// starts return immediately while the daemon monitor owns the process.
+    fn handle_exec_start(&self, mut request: Request) {
+        let url = request.url().to_string();
+        let path = url.split_once('?').map_or(url.as_str(), |(path, _)| path);
+        let (_, path) = version::split_version(path);
+        let segments: Vec<&str> = path
+            .trim_matches('/')
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        let Some(id) = segments.get(1).copied() else {
+            self.respond(request, Err(ApiError::not_found("page not found")));
+            return;
+        };
+        let body = match read_body(&mut request) {
+            Ok(body) => body,
+            Err(error) => {
+                self.respond(request, Err(error));
+                return;
+            }
+        };
+        let options: ExecStartRequestDto = if body.is_empty() {
+            ExecStartRequestDto::default()
+        } else {
+            match serde_json::from_slice(&body) {
+                Ok(options) => options,
+                Err(error) => {
+                    self.respond(
+                        request,
+                        Err(ApiError::bad_request(format!(
+                            "invalid exec start request: {error}"
+                        ))),
+                    );
+                    return;
+                }
+            }
+        };
+        if let Err(error) = options.validate() {
+            self.respond(request, Err(ApiError::from(error)));
+            return;
+        }
+        let session = match self.daemon.exec_start(id) {
+            Ok(session) => session,
+            Err(error) => {
+                self.respond(request, Err(ApiError::from(error)));
+                return;
+            }
+        };
+        if options.detach {
+            self.respond(request, Ok(Reply::empty(200)));
+            return;
+        }
+        if !session.open_stdout && !session.open_stderr {
+            self.respond(request, Ok(Reply::empty(200)));
+            return;
+        }
+        let stream = match (session.open_stdout, session.open_stderr) {
+            (true, true) => None,
+            (true, false) => Some(LogStreamSource::Stdout),
+            (false, true) => Some(LogStreamSource::Stderr),
+            (false, false) => None,
+        };
+        let mut entry_stream = EntryStream {
+            store: session.logs,
+            replay: VecDeque::new(),
+            next: 0,
+            stream,
+            timestamps: false,
+            since_nanos: None,
+            until_nanos: None,
+            current: Vec::new(),
+            offset: 0,
+            closed: false,
+        };
+
+        let upgrade = request
+            .headers()
+            .iter()
+            .any(|header| header.field.equiv("Upgrade"));
+        if !upgrade {
+            self.respond(
+                request,
+                Ok(Reply::stream(
+                    VIEW_MULTIPLEXED_STREAM,
+                    Box::new(entry_stream),
+                )),
+            );
+            return;
+        }
+
+        let mut headers = self.base_headers();
+        headers.push(header("Content-Type", VIEW_MULTIPLEXED_STREAM));
+        let response = Response::new(
+            StatusCode(101),
+            headers,
+            Cursor::new(Vec::new()),
+            Some(0),
+            None,
+        );
+        let mut connected = request.upgrade("tcp", response);
+        let mut buffer = [0u8; 8192];
+        loop {
+            match entry_stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    if let Err(error) = connected.write_all(&buffer[..count]) {
+                        tracing::debug!(error = %error, "exec client disconnected");
+                        break;
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(error = %error, "reading exec stream failed");
+                    break;
+                }
+            }
+        }
+        if let Err(error) = connected.flush() {
+            tracing::debug!(error = %error, "flushing exec stream failed");
+        }
+    }
+
     fn route(&self, request: &mut Request) -> std::result::Result<Reply, ApiError> {
         let url = request.url();
         let (path, raw_query) = match url.split_once('?') {
@@ -463,6 +620,10 @@ impl ApiServer {
             ["containers", "json"] if method == "GET" => self.list(query),
             ["containers", "create"] if method == "POST" => self.create(request, &query),
             ["containers", id, "json"] if method == "GET" => self.inspect(id),
+            ["containers", id, "exec"] if method == "POST" => {
+                let id = id.to_string();
+                self.exec_create(request, &id)
+            }
             ["containers", id, "start"] if method == "POST" => self.action(id, Action::Start),
             ["containers", id, "stop"] if method == "POST" => self.stop(id, &query),
             ["containers", id, "restart"] if method == "POST" => self.restart(id, &query),
@@ -473,6 +634,10 @@ impl ApiServer {
             ["containers", id] if method == "DELETE" => self.remove(id, &query),
             ["containers", id, "logs"] if method == "GET" => self.container_logs(id, &query),
             ["containers", id, action] => self.unsupported_container_action(id, action),
+            ["exec", id, "json"] if method == "GET" => self.exec_inspect(id),
+            ["exec", id, "resize"] if method == "POST" => Err(ApiError::from(Error::unsupported(
+                "exec resize requires TTY support, which is not implemented",
+            ))),
             ["images", "json"] if method == "GET" => self.image_list(&query),
             ["images", "create"] if method == "POST" => self.image_pull(request, &query),
             ["images", "prune"] if method == "POST" => Err(ApiError::from(Error::unsupported(
@@ -1033,6 +1198,26 @@ impl ApiServer {
         ))
     }
 
+    fn exec_create(&self, request: &mut Request, id: &str) -> std::result::Result<Reply, ApiError> {
+        let body = read_json_body(request)?;
+        if body.is_empty() {
+            return Err(ApiError::bad_request("exec create requires a JSON body"));
+        }
+        let dto: ExecCreateRequestDto = serde_json::from_slice(&body)
+            .map_err(|error| ApiError::bad_request(format!("invalid exec request: {error}")))?;
+        let config = dto.into_config().map_err(ApiError::from)?;
+        let view = self
+            .daemon
+            .exec_create(id, config)
+            .map_err(ApiError::from)?;
+        Ok(Reply::json(201, &serde_json::json!({ "Id": view.id })))
+    }
+
+    fn exec_inspect(&self, id: &str) -> std::result::Result<Reply, ApiError> {
+        let view = self.daemon.exec_inspect(id).map_err(ApiError::from)?;
+        Ok(Reply::json(200, &ExecInspectResponse::from(view)))
+    }
+
     fn action(&self, id: &str, action: Action) -> std::result::Result<Reply, ApiError> {
         match action {
             Action::Start => {
@@ -1087,33 +1272,24 @@ impl ApiServer {
     }
 
     fn wait(&self, id: &str, query: &Query) -> std::result::Result<Reply, ApiError> {
-        match query.get("condition").unwrap_or("not-running") {
-            "" | "not-running" => {}
-            "next-exit" | "removed" => {
-                return Err(ApiError::from(Error::unsupported(format!(
-                    "wait condition {:?} is not implemented; use \"not-running\"",
-                    query.get("condition").unwrap_or_default()
-                ))))
-            }
+        let condition = match query.get("condition").unwrap_or("not-running") {
+            "" | "not-running" => docker_daemon::WaitCondition::NotRunning,
+            "next-exit" => docker_daemon::WaitCondition::NextExit,
+            "removed" => docker_daemon::WaitCondition::Removed,
             other => {
                 return Err(ApiError::bad_request(format!(
                     "invalid wait condition {other:?}"
                 )))
             }
-        }
-        loop {
-            let view = self.daemon.inspect(id).map_err(ApiError::from)?;
-            if !view.state.status.is_alive() {
-                return Ok(Reply::json(
-                    200,
-                    &WaitResponse {
-                        status_code: i64::from(view.state.exit_code.unwrap_or(0)),
-                        error: None,
-                    },
-                ));
-            }
-            thread::sleep(Duration::from_millis(25));
-        }
+        };
+        let outcome = self.daemon.wait(id, condition).map_err(ApiError::from)?;
+        Ok(Reply::json(
+            200,
+            &WaitResponse {
+                status_code: i64::from(outcome.status_code),
+                error: None,
+            },
+        ))
     }
 
     /// `GET /containers/{id}/logs` — mirrors Moby's `getContainersLogs`:
@@ -1453,16 +1629,43 @@ fn push_load_message(body: &mut Vec<u8>, stream: String) -> std::result::Result<
     Ok(())
 }
 
-fn read_json_body(request: &mut Request) -> std::result::Result<Vec<u8>, ApiError> {
+fn read_body(request: &mut Request) -> std::result::Result<Vec<u8>, ApiError> {
     let content_type = request
         .headers()
         .iter()
         .find(|header| header.field.equiv("Content-Type"))
         .map(|header| header.value.as_str().to_string());
-    let has_body = request
-        .body_length()
+    let transfer_encoding = request
+        .headers()
+        .iter()
+        .any(|header| header.field.equiv("Transfer-Encoding"));
+    let is_upgrade = request.headers().iter().any(|header| {
+        (header.field.equiv("Connection")
+            && header
+                .value
+                .as_str()
+                .split(',')
+                .any(|value| value.trim().eq_ignore_ascii_case("upgrade")))
+            || header.field.equiv("Upgrade")
+    });
+    let body_length = request.body_length();
+    if is_upgrade && body_length.is_none() {
+        // tiny_http hands the raw socket to upgrade-capable requests and
+        // ignores HTTP body framing. Without Content-Length there is no
+        // reliable boundary before the hijacked stream, so a chunked body
+        // would make read_to_end wait forever. Treat a bodyless upgrade as
+        // empty (bodyless exec start is valid) and reject ambiguous chunked
+        // requests explicitly.
+        if transfer_encoding {
+            return Err(ApiError::bad_request(
+                "chunked request bodies are not supported on upgrade-capable endpoints; send Content-Length",
+            ));
+        }
+        return Ok(Vec::new());
+    }
+    let has_body = body_length
         .map(|length| length > 0)
-        .unwrap_or(true);
+        .unwrap_or(transfer_encoding);
     if has_body {
         let Some(content_type) = content_type.as_deref() else {
             return Err(ApiError::bad_request(
@@ -1482,17 +1685,41 @@ fn read_json_body(request: &mut Request) -> std::result::Result<Vec<u8>, ApiErro
         }
     }
     let mut body = Vec::new();
-    request
-        .as_reader()
-        .take((MAX_BODY_BYTES + 1) as u64)
-        .read_to_end(&mut body)
-        .map_err(|error| ApiError::bad_request(format!("failed to read request body: {error}")))?;
-    if body.len() > MAX_BODY_BYTES {
-        return Err(ApiError {
-            status: 413,
-            message: format!("request body exceeds {MAX_BODY_BYTES} bytes"),
-        });
+    if let Some(length) = body_length {
+        if length > MAX_BODY_BYTES {
+            return Err(ApiError {
+                status: 413,
+                message: format!("request body exceeds {MAX_BODY_BYTES} bytes"),
+            });
+        }
+        // With `Connection: Upgrade`, tiny_http exposes the raw socket as the
+        // request reader and ignores Content-Length. Exec start sends a JSON
+        // body on an upgrade-capable request, so read exactly the advertised
+        // length instead of waiting for socket EOF (which never comes).
+        body.resize(length, 0);
+        request.as_reader().read_exact(&mut body).map_err(|error| {
+            ApiError::bad_request(format!("failed to read request body: {error}"))
+        })?;
+    } else {
+        request
+            .as_reader()
+            .take((MAX_BODY_BYTES + 1) as u64)
+            .read_to_end(&mut body)
+            .map_err(|error| {
+                ApiError::bad_request(format!("failed to read request body: {error}"))
+            })?;
+        if body.len() > MAX_BODY_BYTES {
+            return Err(ApiError {
+                status: 413,
+                message: format!("request body exceeds {MAX_BODY_BYTES} bytes"),
+            });
+        }
     }
+    Ok(body)
+}
+
+fn read_json_body(request: &mut Request) -> std::result::Result<Vec<u8>, ApiError> {
+    let body = read_body(request)?;
     if body.is_empty() {
         return Err(ApiError::bad_request(
             "invalid JSON: got EOF while reading request body",
@@ -1848,6 +2075,10 @@ impl Read for EntryStream {
             }
             self.current.clear();
             self.offset = 0;
+            if let Some(backlog) = self.replay.pop_front() {
+                self.current = backlog;
+                continue;
+            }
             if self.closed {
                 return Ok(0);
             }
@@ -1856,10 +2087,6 @@ impl Read for EntryStream {
                     self.closed = true;
                     return Ok(0);
                 }
-            }
-            if let Some(backlog) = self.replay.pop_front() {
-                self.current = backlog;
-                continue;
             }
             // Snapshot + closed-flag read atomically so a record appended
             // right before the close flip cannot be missed.

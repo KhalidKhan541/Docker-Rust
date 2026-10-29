@@ -12,13 +12,16 @@ use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use docker_api::{ApiServer, RunningServer};
 use docker_common::{Digest, ImageRef};
-use docker_daemon::{Daemon, Stream as LogStream, SyntheticBehavior, SyntheticRuntime};
+use docker_daemon::{
+    Daemon, Stream as LogStream, SyntheticBehavior, SyntheticExecBehavior, SyntheticRuntime,
+};
 use docker_events::EventBroker;
 use docker_image::{
     Descriptor, EmptyObject, Image, ImageConfig, Manifest, Platform, RootFS,
@@ -158,12 +161,27 @@ fn http(
 /// Send an Engine attach request with the Docker CLI's TCP upgrade handshake
 /// and return the raw upgraded response. The server owns the connection until
 /// the log store reaches EOF, so this also verifies that attach closes cleanly.
-fn http_upgrade(addr: SocketAddr, path: &str) -> Response {
-    http_upgrade_with_body(addr, path, &[])
-}
-
 /// Upgrade request with an optional JSON body, used by exec-start tests.
 fn http_upgrade_with_body(addr: SocketAddr, path: &str, body: &[u8]) -> Response {
+    http_upgrade_with(addr, path, body, || {})
+}
+
+/// Upgrade request that runs `after_headers` once the `101` response has been
+/// read. Lets a test append/close logs only after the attach stream exists.
+fn http_upgrade_after_headers(
+    addr: SocketAddr,
+    path: &str,
+    after_headers: impl FnOnce(),
+) -> Response {
+    http_upgrade_with(addr, path, &[], after_headers)
+}
+
+fn http_upgrade_with(
+    addr: SocketAddr,
+    path: &str,
+    body: &[u8],
+    after_headers: impl FnOnce(),
+) -> Response {
     let mut stream = TcpStream::connect(addr).expect("connect to API listener");
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -199,6 +217,7 @@ fn http_upgrade_with_body(addr: SocketAddr, path: &str, body: &[u8]) -> Response
                 .or_insert_with(|| value.trim().to_string());
         }
     }
+    after_headers();
     let mut body = Vec::new();
     reader
         .read_to_end(&mut body)
@@ -225,6 +244,18 @@ fn spawn_api_with_daemon() -> (RunningServer, Arc<Daemon>) {
     let runtime = Arc::new(SyntheticRuntime::with_behavior(
         SyntheticBehavior::running_until_killed(),
     ));
+    let broker = Arc::new(EventBroker::new());
+    let daemon = Arc::new(Daemon::spawn(runtime, broker.clone()).unwrap());
+    let api = Arc::new(ApiServer::new(daemon.clone(), broker));
+    let server = api.serve("127.0.0.1:0").unwrap();
+    (server, daemon)
+}
+
+fn spawn_api_with_exec(exec: SyntheticExecBehavior) -> (RunningServer, Arc<Daemon>) {
+    let runtime = Arc::new(
+        SyntheticRuntime::with_behavior(SyntheticBehavior::running_until_killed())
+            .with_exec_behavior(exec),
+    );
     let broker = Arc::new(EventBroker::new());
     let daemon = Arc::new(Daemon::spawn(runtime, broker.clone()).unwrap());
     let api = Arc::new(ApiServer::new(daemon.clone(), broker));
@@ -644,6 +675,87 @@ fn container_lifecycle_over_http() {
     let gone = http(addr, "GET", &format!("/containers/{id}/json"), None, None);
     assert_eq!(gone.status, 404);
     assert!(gone.text().contains("no such container"));
+}
+
+#[test]
+fn wait_conditions_observe_the_next_exit_and_removal() {
+    let (server, runtime) = spawn_api();
+    let addr = server.addr();
+
+    let id = create(addr, "next-exit", "alpine:3.20", None);
+    let wait_id = id.clone();
+    let waiter = thread::spawn(move || {
+        http(
+            addr,
+            "POST",
+            &format!("/containers/{wait_id}/wait?condition=next-exit"),
+            None,
+            None,
+        )
+    });
+    thread::sleep(Duration::from_millis(50));
+    runtime.set_behavior(SyntheticBehavior::exits_after(Duration::from_millis(10), 7));
+    assert_eq!(
+        http(addr, "POST", &format!("/containers/{id}/start"), None, None).status,
+        204
+    );
+    let waited = waiter.join().unwrap();
+    assert_eq!(waited.status, 200, "{}", waited.text());
+    assert_eq!(waited.json()["StatusCode"], 7);
+
+    let already_exited = id.clone();
+    let next_waiter = thread::spawn(move || {
+        http(
+            addr,
+            "GET",
+            &format!("/containers/{already_exited}/wait?condition=next-exit"),
+            None,
+            None,
+        )
+    });
+    thread::sleep(Duration::from_millis(50));
+    assert!(
+        !next_waiter.is_finished(),
+        "next-exit must not replay the previous exit"
+    );
+    runtime.set_behavior(SyntheticBehavior::exits_after(
+        Duration::from_millis(200),
+        9,
+    ));
+    assert_eq!(
+        http(addr, "POST", &format!("/containers/{id}/start"), None, None).status,
+        204
+    );
+    let next = next_waiter.join().unwrap();
+    assert_eq!(next.status, 200, "{}", next.text());
+    assert_eq!(next.json()["StatusCode"], 9);
+
+    let removed_id = create(addr, "removed-wait", "alpine:3.20", None);
+    let wait_id = removed_id.clone();
+    let removed_waiter = thread::spawn(move || {
+        http(
+            addr,
+            "POST",
+            &format!("/containers/{wait_id}/wait?condition=removed"),
+            None,
+            None,
+        )
+    });
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        http(
+            addr,
+            "DELETE",
+            &format!("/containers/{removed_id}"),
+            None,
+            None
+        )
+        .status,
+        204
+    );
+    let removed = removed_waiter.join().unwrap();
+    assert_eq!(removed.status, 200, "{}", removed.text());
+    assert_eq!(removed.json()["StatusCode"], 0);
 }
 
 #[test]
@@ -1528,39 +1640,81 @@ fn attach_supports_upgrade_logs_and_stream_filters() {
     store.append(LogStream::Stderr, b"err\n");
     store.close();
 
-    let response = http_upgrade(
+    let backlog = http(
         addr,
-        &format!("/v1.51/containers/{id}/attach?stream=1&logs=1&stdout=1&stderr=1"),
+        "POST",
+        &format!("/v1.51/containers/{id}/attach?stream=0&logs=1&stdout=1&stderr=1"),
+        None,
+        None,
     );
-    assert_eq!(response.status, 101);
+    assert_eq!(backlog.status, 200, "{}", backlog.text());
     assert_eq!(
-        response.header("content-type"),
+        backlog.header("content-type"),
         Some("application/vnd.docker.multiplexed-stream")
     );
-    assert_eq!(response.header("upgrade"), Some("tcp"));
     let mut expected = Vec::new();
     expected.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 4]);
     expected.extend_from_slice(b"out\n");
     expected.extend_from_slice(&[2, 0, 0, 0, 0, 0, 0, 4]);
     expected.extend_from_slice(b"err\n");
-    assert_eq!(response.body, expected);
+    assert_eq!(backlog.body, expected);
 
-    let stdout_only = http_upgrade(
+    let stdout_only = http(
         addr,
-        &format!("/containers/{id}/attach?stream=1&logs=1&stdout=1&stderr=0"),
+        "POST",
+        &format!("/containers/{id}/attach?stream=0&logs=1&stdout=1&stderr=0"),
+        None,
+        None,
     );
-    assert_eq!(stdout_only.status, 101);
+    assert_eq!(stdout_only.status, 200, "{}", stdout_only.text());
     assert_eq!(
         stdout_only.body,
         [1, 0, 0, 0, 0, 0, 0, 4, b'o', b'u', b't', b'\n']
     );
 
-    let no_logs = http_upgrade(
+    let no_logs = http(
         addr,
-        &format!("/containers/{id}/attach?stream=1&logs=0&stdout=1&stderr=1"),
+        "POST",
+        &format!("/containers/{id}/attach?stream=0&logs=0&stdout=1&stderr=1"),
+        None,
+        None,
     );
-    assert_eq!(no_logs.status, 101);
+    assert_eq!(no_logs.status, 200, "{}", no_logs.text());
     assert!(no_logs.body.is_empty());
+
+    // A stopped container's store is closed, but the first half of
+    // `docker start -a` is attaching before the start. The stream must stay
+    // open, deliver records appended later, and then close with the store.
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let stream_id = id.clone();
+    let streaming = thread::spawn(move || {
+        http_upgrade_after_headers(
+            addr,
+            &format!("/v1.51/containers/{stream_id}/attach?stream=1&logs=0&stdout=1&stderr=1"),
+            move || {
+                let _ = ready_tx.send(());
+            },
+        )
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("attach upgraded to a raw stream");
+    store.append(LogStream::Stdout, b"live-out\n");
+    store.append(LogStream::Stderr, b"live-err\n");
+    store.close();
+    let streamed = streaming.join().unwrap();
+    assert_eq!(streamed.status, 101);
+    assert_eq!(
+        streamed.header("content-type"),
+        Some("application/vnd.docker.multiplexed-stream")
+    );
+    assert_eq!(streamed.header("upgrade"), Some("tcp"));
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 9]);
+    expected.extend_from_slice(b"live-out\n");
+    expected.extend_from_slice(&[2, 0, 0, 0, 0, 0, 0, 9]);
+    expected.extend_from_slice(b"live-err\n");
+    assert_eq!(streamed.body, expected);
 
     let missing = http(
         addr,
@@ -1590,4 +1744,137 @@ fn attach_supports_upgrade_logs_and_stream_filters() {
         None,
     );
     assert_eq!(too_new.status, 400, "{}", too_new.text());
+}
+
+#[test]
+fn exec_api_validates_options_and_runtime_boundary() {
+    let (server, _daemon) = spawn_api_with_daemon();
+    let addr = server.addr();
+    let id = create(addr, "exec-target", "alpine:3.20", None);
+
+    let create_exec = |addr: SocketAddr, container: &str, body: Value| {
+        let body = serde_json::to_vec(&body).unwrap();
+        http(
+            addr,
+            "POST",
+            &format!("/v1.51/containers/{container}/exec"),
+            Some(&body),
+            Some("application/json"),
+        )
+    };
+
+    let request = json!({
+        "User": "",
+        "Privileged": false,
+        "Tty": false,
+        "AttachStdin": false,
+        "AttachStdout": true,
+        "AttachStderr": true,
+        "DetachKeys": "",
+        "Env": [],
+        "WorkingDir": "",
+        "Cmd": ["/bin/echo", "hi"]
+    });
+    let not_running = create_exec(addr, &id, request.clone());
+    assert_eq!(not_running.status, 409, "{}", not_running.text());
+
+    let started = http(addr, "POST", &format!("/containers/{id}/start"), None, None);
+    assert_eq!(started.status, 204, "{}", started.text());
+    wait_for_state(addr, &id, "running");
+
+    let created = create_exec(addr, &id, request);
+    assert_eq!(created.status, 201, "{}", created.text());
+    let exec_id = created.json()["Id"].as_str().unwrap().to_string();
+
+    let inspected = http(addr, "GET", &format!("/exec/{exec_id}/json"), None, None);
+    assert_eq!(inspected.status, 200, "{}", inspected.text());
+    assert_eq!(inspected.json()["ContainerID"], id);
+    assert_eq!(inspected.json()["Running"], false);
+    assert_eq!(inspected.json()["ExitCode"], 0);
+
+    let body = serde_json::to_vec(&json!({ "Detach": false, "Tty": false })).unwrap();
+    let unsupported = http_upgrade_with_body(addr, &format!("/v1.51/exec/{exec_id}/start"), &body);
+    assert_eq!(unsupported.status, 501, "{}", unsupported.text());
+    assert!(unsupported.text().contains("exec is not implemented"));
+
+    let mut tty = request_without_privilege();
+    tty["Tty"] = json!(true);
+    let tty = create_exec(addr, &id, tty);
+    assert_eq!(tty.status, 501, "{}", tty.text());
+
+    let mut stdin = request_without_privilege();
+    stdin["AttachStdin"] = json!(true);
+    let stdin = create_exec(addr, &id, stdin);
+    assert_eq!(stdin.status, 501, "{}", stdin.text());
+
+    let missing = create_exec(addr, "does-not-exist", request_without_privilege());
+    assert_eq!(missing.status, 404, "{}", missing.text());
+    let missing_inspect = http(addr, "GET", "/exec/does-not-exist/json", None, None);
+    assert_eq!(missing_inspect.status, 404, "{}", missing_inspect.text());
+
+    let mut named_user = request_without_privilege();
+    named_user["User"] = json!("nobody");
+    let named_user = create_exec(addr, &id, named_user);
+    assert_eq!(named_user.status, 501, "{}", named_user.text());
+    assert!(named_user.text().contains("numeric UID"));
+}
+
+#[test]
+fn exec_attach_streams_output_and_reports_exit_code() {
+    let (server, _daemon) =
+        spawn_api_with_exec(SyntheticExecBehavior::immediate(b"exec-out\n", b"", 7));
+    let addr = server.addr();
+    let id = create(addr, "exec-success", "alpine:3.20", None);
+    let started = http(addr, "POST", &format!("/containers/{id}/start"), None, None);
+    assert_eq!(started.status, 204, "{}", started.text());
+    wait_for_state(addr, &id, "running");
+
+    let body = serde_json::to_vec(&request_without_privilege()).unwrap();
+    let created = http(
+        addr,
+        "POST",
+        &format!("/v1.51/containers/{id}/exec"),
+        Some(&body),
+        Some("application/json"),
+    );
+    assert_eq!(created.status, 201, "{}", created.text());
+    let exec_id = created.json()["Id"].as_str().unwrap().to_string();
+
+    let start = serde_json::to_vec(&json!({ "Detach": false, "Tty": false })).unwrap();
+    let response = http_upgrade_with_body(addr, &format!("/v1.51/exec/{exec_id}/start"), &start);
+    assert_eq!(response.status, 101, "{}", response.text());
+    assert_eq!(
+        response.header("content-type"),
+        Some("application/vnd.docker.multiplexed-stream")
+    );
+    assert_eq!(response.header("upgrade"), Some("tcp"));
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 9]);
+    expected.extend_from_slice(b"exec-out\n");
+    assert_eq!(response.body, expected);
+
+    let inspected = http(addr, "GET", &format!("/exec/{exec_id}/json"), None, None);
+    assert_eq!(inspected.status, 200, "{}", inspected.text());
+    let inspected = inspected.json();
+    assert_eq!(inspected["ID"], exec_id);
+    assert_eq!(inspected["ContainerID"], id);
+    assert_eq!(inspected["Running"], false);
+    assert_eq!(inspected["ExitCode"], 7);
+    assert_eq!(inspected["OpenStdout"], true);
+    assert_eq!(inspected["OpenStderr"], true);
+}
+
+fn request_without_privilege() -> Value {
+    json!({
+        "User": "",
+        "Privileged": false,
+        "Tty": false,
+        "AttachStdin": false,
+        "AttachStdout": true,
+        "AttachStderr": true,
+        "DetachKeys": "ctrl-p,ctrl-q",
+        "Env": null,
+        "WorkingDir": "",
+        "Cmd": ["/bin/echo", "hi"]
+    })
 }
