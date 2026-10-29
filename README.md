@@ -10,11 +10,11 @@ specifications.
 **Project status: Milestones A—E complete; the native Linux runtime executes
 real containers in materialized image rootfs on `ubuntu-latest` CI (this
 Windows host cannot run it locally); Milestone F/G has a runnable
-Docker-compatible container-lifecycle, image-management, image-save/load, and
-logs HTTP API with real registry pulls, persistent image metadata, container
-records/logs that survive daemon restarts, and an opt-in same-origin static
-console (`--web-root`). Attach, exec, and process re-attachment across a daemon
-restart are still pending — see
+Docker-compatible container-lifecycle, image-management, image-save/load,
+logs/attach/exec, and wait HTTP API with real registry pulls, persistent image
+metadata, container records/logs that survive daemon restarts, and an opt-in
+same-origin static console (`--web-root`). Process re-attachment across a
+daemon restart and interactive TTY/stdin are still pending — see
 [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).**
 
 ## Motivation and scope
@@ -65,19 +65,23 @@ Current milestone map:
   process through unshare/chroot/`/proc`/identity drop in a materialized
   image rootfs.
 * **F/G — Engine HTTP API** *(container + image-management + archive + logs +
-  persistence slices implemented)*: Docker API `1.24`–`1.51` gate,
+  attach + exec + wait + persistence slices implemented)*: Docker API `1.24`–`1.51` gate,
   `/_ping`, `/version`, `/info`, container create/list/inspect/start/stop/
-  restart/kill/wait/delete, image list/pull/inspect/history/tag/delete,
-  image save/load (`/images/get`, `/images/{name}/get`, `/images/load`),
-  streaming `/events` with replay, `/containers/{id}/logs`, an opt-in
-  same-origin console/static root (`--web-root`), and a runnable `docker-rsd`
+  restart/kill/delete, all three Moby wait conditions, image
+  list/pull/inspect/history/tag/delete, image save/load (`/images/get`,
+  `/images/{name}/get`, `/images/load`), streaming `/events` with replay,
+  stdcopy-framed `/containers/{id}/logs`, output-only `/containers/{id}/attach`,
+  non-interactive exec create/start/inspect, an opt-in same-origin
+  console/static root (`--web-root`), and a runnable `docker-rsd`
   binary with a persistent image and container-record/log store. Real registry
   pulls (multi-platform manifests, verified layers), Docker Hub, Docker
   save/load archives, and the real Docker CLI v29.9.1 have been exercised. It
   defaults to the synthetic runtime; `--runtime oci` materializes image rootfs
-  and runs real containers (verified on `ubuntu-latest` CI). Container records,
-  logs, and restart policies survive a daemon restart; a lost process is
-  reported exited (255) and only restarted when its policy says so.
+  and runs real containers, including foreground `docker run` attach and
+  `docker exec` (verified on `ubuntu-latest` CI). Container records, logs, and
+  restart policies survive a daemon restart; a lost process is reported exited
+  (255) and only restarted when its policy says so; exec records do not survive
+  a restart.
 * **H/I — Builder**, **J — CLI**, **K — Security hardening**,
   **L — Conformance & differential**: planned. See `docs/ROADMAP.md`.
 
@@ -187,9 +191,11 @@ reported honestly instead of silently selecting another architecture.
 The daemon defaults to the **synthetic runtime**: container lifecycle state,
 the API, and events are real, but no host process is executed. On Linux,
 `--runtime oci` executes real containers and captures their stdout/stderr for
-`docker logs`; attach/exec, TTY, and bridge networking remain explicit
-`Unsupported`, so foreground `docker run` (which needs attach) is not
-available yet. Container records and logs survive a daemon restart. A process
+`docker logs`; output-only attach and non-interactive exec work through the
+real Docker CLI, including foreground `docker run`, `docker exec`, and exit
+status propagation. Interactive TTY/stdin, exec resize, and bridge networking
+remain explicit `Unsupported`. Container records and logs survive a daemon
+restart; exec records are in-memory. A process
 that was running when the daemon stopped cannot be adopted, so it is reported
 exited with code 255; the helper dies with the daemon (taking its PID namespace
 with it), and containers with `--restart always`, `unless-stopped`, or

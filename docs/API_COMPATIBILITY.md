@@ -52,7 +52,13 @@ before routing. Errors use Moby's `{"message":"..."}` envelope with the
 | `POST` | `/containers/{id}/stop` | implemented; `t` timeout, `204`, or `304` when already stopped |
 | `POST` | `/containers/{id}/restart` | implemented; `t` timeout |
 | `POST` | `/containers/{id}/kill` | implemented; signal name or number |
-| `POST`, `GET` | `/containers/{id}/wait` | implemented for `not-running`; returns `StatusCode`; `next-exit`/`removed` return 501 |
+| `POST`, `GET` | `/containers/{id}/wait` | implemented for `not-running` (default), `next-exit`, and `removed`; returns `StatusCode`; actor-side waiters, no polling |
+| `GET` | `/containers/{id}/logs` | implemented; stdcopy frames, `follow`, `timestamps`, `tail`, `since`/`until`, stdout/stderr filters; `details` returns 501 |
+| `POST` | `/containers/{id}/attach` | implemented output-only; stdcopy frames over `101` upgrade or chunked `200`; `stream`, `logs`, stdout/stderr handled; `stdin=1` returns 501 |
+| `POST` | `/containers/{id}/exec` | implemented; validates numeric `UID[:GID]`; TTY, stdin, and privileged mode return 501 |
+| `POST` | `/exec/{id}/start` | implemented; non-TTY/non-interactive; `101` multiplexed upgrade or chunked `200`; detached start returns 200 |
+| `GET` | `/exec/{id}/json` | implemented; `Running`, `ExitCode`, `Pid`, and process config |
+| `POST` | `/exec/{id}/resize` | returns 501; resize requires TTY support |
 | `DELETE` | `/containers/{id}` | implemented; `force` and `v` query parameters |
 | `GET` | `/images/json` | implemented; `all`; empty `filters` only (non-empty filters return 501) |
 | `POST` | `/images/create` | implemented for registry pulls (`fromImage`, `tag`, `platform`, `X-Registry-Auth` username/password); `fromSrc` and `repo`/`message` return 501 |
@@ -87,13 +93,55 @@ ports, and stop signal become the container defaults; explicit container
 values win. `Env` replacement follows `docker run -e` key semantics rather
 than appending a duplicate key.
 
+### Attach, exec, and wait
+
+- **Attach is output-only.** `stdout`/`stderr` select the streams, `logs=1`
+  replays the retained backlog before following, and `stream=0` returns the
+  available backlog and closes. A request carrying `Upgrade` receives `101`
+  and a raw multiplexed body; other clients receive a chunked `200` body with
+  `Content-Type: application/vnd.docker.multiplexed-stream`. A streaming
+  attach to a stopped container stays open until the next start/exit or
+  removal, which is what `docker start -a` relies on. The Docker CLI's
+  `detachKeys` value is accepted but unused. `stdin=1` is rejected explicitly
+  because stdin transport is not implemented; TTY containers cannot be
+  created.
+- **Exec is non-interactive.** `POST /containers/{id}/exec` accepts
+  `User`, `Env` (including Go's `null`), `WorkingDir`, `Cmd`, `AttachStdout`,
+  `AttachStderr`, and configured `DetachKeys`; `Tty`, `AttachStdin`, and
+  `Privileged` return explicit `501` errors. Numeric `UID[:GID]` values are
+  accepted and validated at create and start. A missing GID is resolved from
+  the container's `/etc/passwd`, and supplementary groups from `/etc/group`;
+  named users still return `501` because name lookup is not implemented. A
+  non-detached start streams output with stdcopy framing; a detached start
+  returns `200` immediately. Exec records are in-memory and are deleted with
+  their container.
+- **Exec exit ordering.** The exec monitor publishes the exit status to the
+  actor and waits for acknowledgement before releasing its log-writer lease.
+  Consequently, the attach stream reaches EOF only after `GET /exec/{id}/json`
+  can report the final `ExitCode`; the Docker CLI's attach-then-inspect flow
+  therefore works without a race.
+- **Wait conditions.** `not-running` returns immediately when the state is not
+  alive (`created`, `exited`, `dead`, or `removing`); `restarting` counts as
+  alive, so the waiter stays blocked across a restart, matching Moby.
+  `next-exit` never replays a previous exit: it blocks on `created`, `exited`,
+  `dead`, and every running/restarting state until the next process exit
+  (including exits followed by restart-policy replacements). A restart or
+  forced-stop failure that can no longer produce an exit wakes the waiter
+  with the last status. `removed` waits for container removal and returns the
+  last known exit status. Waiters live in the actor and are woken by state
+  transitions, not polling. The Docker CLI foreground `docker run` and
+  `docker start -a` flows use `next-exit` and receive the new process's exit
+  status.
+
 Smoke-tested against the real static Docker CLI: `docker version`, `docker
 info`, `docker pull`, `docker images`, `docker image inspect`, `docker tag`,
 `docker rmi`, `docker create`, `docker run -d`, `docker ps`, `docker
 inspect`, `docker start`, `docker stop`, `docker kill`, `docker rm`, `docker
-wait`, and `docker events` all drive the daemon over TCP. `docker logs`,
-`attach`, `exec`, and foreground `docker run` correctly fail with an
-explicit `Unsupported` response until the runtime captures stdio.
+wait`, and `docker events` all drive the daemon over TCP. On Linux CI, the
+same CLI additionally exercises foreground `docker run` attach and
+`docker exec`, including `--user 1000:1000`, multiplexed output, and `/exit7`
+status 7. Interactive stdin, TTY, resize, and privileged exec remain
+explicitly unsupported.
 
 ### Image pulls
 
@@ -225,10 +273,18 @@ authenticated TLS proxy in front of the daemon.
   metadata value, `host` and `none` are accepted, but no bridge, veth, DNS,
   port publishing, or named/container network setup occurs. Named and
   `container:` network modes are rejected at create.
-- **No attach/exec/stats/top/changes/export/archive/pause/update/rename/
-  resize.** Container subresources not listed above return HTTP 501 with a
-  `not implemented` message. `/containers/{id}/logs` is implemented over the
-  persisted capture store.
+- **Attach and exec are deliberately narrow.** Attach is output-only: stdin
+  and TTY are rejected, and WebSocket upgrade is not implemented (the Docker
+  CLI's HTTP `101` upgrade and chunked fallback are). Exec is non-interactive
+  and non-TTY: no stdin, resize, or privileged mode; users must be numeric
+  `UID[:GID]` (the GID and supplementary groups may be resolved from the
+  container's `/etc/passwd` and `/etc/group`). Exec records live only in memory
+  and are not restored after a daemon restart. No stats, top, changes, export,
+  archive, pause/unpause, update, rename, or resize endpoints exist; unlisted
+  container subresources return HTTP 501 with a `not implemented` message.
+- **Wait requests have no per-client cancellation.** A client that disconnects
+  while waiting for `next-exit` leaves an actor-side waiter until the next exit
+  or daemon shutdown.
 - **Persistence is partial.** Container records (config, host config, state),
   restart policies, and captured logs are stored under
   `<data-root>/containers/<id>/` and restored at daemon startup. A container
@@ -253,8 +309,6 @@ authenticated TLS proxy in front of the daemon.
   expose it to an untrusted network.
 - `/info` values that need image, network, cgroup, or kernel integrations are
   zero/empty placeholders rather than invented data.
-- Hijacked upgrade streams
-  (`application/vnd.docker.multiplexed-stream`) are unimplemented.
 - Swarm endpoints are intentionally out of scope. `/info` reports
   `Swarm.LocalNodeState=inactive`; `/version` does not advertise swarm
   capability keys.
@@ -267,6 +321,12 @@ authenticated TLS proxy in front of the daemon.
 - Start/stop `304` semantics: container start/stop handlers in
   `moby/daemon/start.go` / `moby/daemon/stop.go`.
 - Wait conditions: `moby/api/types/container` and `moby/daemon/wait.go`.
+- Attach upgrade and stdcopy framing: `moby/api/server/router/container/container_routes.go`,
+  `moby/api/types/backend/backend.go`, and the pinned CLI's
+  `cli/command/container/attach.go` / `run.go`.
+- Exec create/start/inspect: `moby/api/types/container/exec.go`,
+  `moby/daemon/exec.go`, and the pinned CLI's
+  `cli/command/container/exec.go`.
 - Event wire shape: `moby/daemon/events/events.go`.
 - Filter vocabulary: `moby/api/types/filters` and daemon container list
   filters.

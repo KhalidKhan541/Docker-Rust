@@ -96,6 +96,14 @@ Implemented:
   drives the reap. Both stages arm `PR_SET_PDEATHSIG(SIGKILL)`, so a daemon
   crash kills the helper and the container PID namespace rather than
   orphaning it. Safe `nix` APIs only (`unsafe_code = "forbid"`).
+- Linux-only exec helper: opens every target namespace descriptor before the
+  first `setns`, joins mount/UTS/IPC/network/cgroup/PID namespaces, chroots
+  through a retained rootfs descriptor, resolves numeric users through
+  `/etc/passwd`/`/etc/group` for primary and supplementary groups, verifies
+  the target is still stage 1's child around descriptor acquisition, and
+  propagates the child's exit code. It matches the container's
+  `no_new_privs: false` default rather than forcing NNP, and carries the spec
+  over bounded stdin JSON so environment values never appear in `argv`.
 
 Exit criterion met on `ubuntu-latest` CI: the runtime smoke test executes a
 real static process inside a materialized image rootfs, and the Engine API
@@ -108,14 +116,16 @@ Known E limits: no cgroups, capability dropping, seccomp, LSM labels, user
 namespaces, TTY, additional mounts, hooks, devices, bridge networking, or
 custom rlimits. Each returns `Unsupported` rather than being ignored.
 
-## F/G — Engine HTTP API (`docker-api`) — **container + image slices runnable**
+## F/G — Engine HTTP API (`docker-api`) — **container + image + attach/exec/wait slices runnable**
 Router + version middleware per `moby/api/common.go` gates; endpoints in
 API_COMPATIBILITY.md order; streaming (`/events`, `/logs`) with
-backpressure; hijack for exec/attach after E.
+backpressure; output-only attach and non-interactive exec over the Docker CLI
+upgrade path.
 
 Implemented: API 1.24–1.51 gate and `/vX.Y` prefixes; `/_ping`, `/version`,
-`/info`; container create/list/inspect/start/stop/restart/kill/wait/remove
-with names and short ids; 304 start/stop semantics; list filters; image
+`/info`; container create/list/inspect/start/stop/restart/kill/remove with
+names and short ids; 304 start/stop semantics; all three Moby wait conditions
+(`not-running`, `next-exit`, `removed`) with actor-side waiters; list filters; image
 list/pull/inspect/history/tag/delete backed by a persistent store and real
 distribution client, including multi-platform selection and verified layer
 downloads; Docker/OCI save/load (`/images/get`, `/images/{name}/get`,
@@ -124,7 +134,9 @@ filtering; create-time image resolution and image default inheritance;
 `/events` history replay + live stream; `/containers/{id}/logs` over captured
 stdio (stdcopy framing, `follow`/`timestamps`/`tail`/`since`/`until` with
 Moby's error messages, relative Go durations, and lease-based follow EOF);
-Docker-cased DTOs with explicit
+output-only attach and non-interactive exec over HTTP `101` upgrade or chunked
+`200`, with numeric `UID[:GID]`, stdcopy capture, inspect, and acknowledged exit
+ordering; Docker-cased DTOs with explicit
 rejection of unsupported fields; synchronous `tiny_http` transport; runnable
 `docker-rsd` binary over TCP with `--data-root` and a native
 `--runtime oci` backed by image-rootfs materialization; and opt-in
@@ -137,9 +149,10 @@ curl-level integration tests, static unit tests, a same-origin Linux smoke
 script, an in-process registry fixture, a live Docker Hub pull, a manual
 Docker CLI v29.9.1 smoke test including save/load, and an `ubuntu-latest`
 smoke run that executes a real container through the Engine API and reads its
-output back from `/containers/{id}/logs`.
+output back from `/containers/{id}/logs`, including foreground `docker run`
+attach and `docker exec` exit-code checks.
 
-Still pending: push/prune, image filters, attach/exec hijack, stats/top, and
+Still pending: push/prune, image filters, interactive TTY/stdin, stats/top, and
 network and volume endpoints. Image metadata and blobs persist; container
 records, restart policies, and captured logs now persist under
 `<data-root>/containers/<id>/` and are restored at startup. A process that was
