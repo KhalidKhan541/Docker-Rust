@@ -16,7 +16,7 @@ cargo clippy -p docker-runtime --target x86_64-unknown-linux-gnu --all-targets -
 
 Current status (Milestones A—E complete; F/G container + image-management +
 image-archive + logs + attach + exec + wait + persistence + console slices
-runnable): **321 tests, 0 failed** across the workspace on Windows; `cargo fmt --check` and clippy with
+runnable): **322 tests, 0 failed** across the workspace on Windows; `cargo fmt --check` and clippy with
 `-D warnings` are clean, and the Linux-only runtime backend is clean under
 `cargo check`/`cargo clippy --target x86_64-unknown-linux-gnu`. The Linux
 backend is executed by CI (`.github/workflows/linux-native.yml`):

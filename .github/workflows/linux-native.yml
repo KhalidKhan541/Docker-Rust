@@ -12,6 +12,9 @@ jobs:
   test:
     name: Linux workspace + native runtime
     runs-on: ubuntu-latest
+    # Bound a wedged Engine API smoke test so its completed logs are available
+    # for diagnosis instead of occupying the runner for the default six hours.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 

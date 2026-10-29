@@ -129,9 +129,12 @@ than appending a duplicate key.
   forced-stop failure that can no longer produce an exit wakes the waiter
   with the last status. `removed` waits for container removal and returns the
   last known exit status. Waiters live in the actor and are woken by state
-  transitions, not polling. The Docker CLI foreground `docker run` and
-  `docker start -a` flows use `next-exit` and receive the new process's exit
-  status.
+  transitions, not polling. Registration completes before the HTTP response
+  starts, so the response headers are sent immediately (Moby's post-1.30
+  behavior) while the JSON body remains open. This is required by the Docker
+  CLI, whose `ContainerWait` call waits for headers before it starts the
+  container. The foreground `docker run` and `docker start -a` flows use
+  `next-exit` and receive the new process's exit status.
 
 Smoke-tested against the real static Docker CLI: `docker version`, `docker
 info`, `docker pull`, `docker images`, `docker image inspect`, `docker tag`,

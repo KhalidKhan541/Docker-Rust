@@ -64,6 +64,20 @@ fn http(
     body: Option<&[u8]>,
     content_type: Option<&str>,
 ) -> Response {
+    http_after_headers(addr, method, path, body, content_type, || {})
+}
+
+/// Like [`http`], but runs `after_headers` after the response headers have
+/// arrived and before the body is read. Used to prove that `/wait` flushes
+/// headers before blocking on the container exit.
+fn http_after_headers(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    content_type: Option<&str>,
+    after_headers: impl FnOnce(),
+) -> Response {
     let mut stream = TcpStream::connect(addr).expect("connect to API listener");
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -108,6 +122,7 @@ fn http(
                 .or_insert_with(|| value.trim().to_string());
         }
     }
+    after_headers();
     let chunked = headers
         .get("transfer-encoding")
         .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"));
@@ -675,6 +690,29 @@ fn container_lifecycle_over_http() {
     let gone = http(addr, "GET", &format!("/containers/{id}/json"), None, None);
     assert_eq!(gone.status, 404);
     assert!(gone.text().contains("no such container"));
+}
+
+#[test]
+fn wait_flushes_headers_before_the_next_exit() {
+    let (server, runtime) = spawn_api();
+    let addr = server.addr();
+    let id = create(addr, "wait-headers", "alpine:3.20", None);
+    runtime.set_behavior(SyntheticBehavior::exits_after(Duration::from_millis(10), 0));
+
+    let path = format!("/containers/{id}/wait?condition=next-exit");
+    let start_id = id.clone();
+    let response = http_after_headers(addr, "POST", &path, None, None, move || {
+        let started = http(
+            addr,
+            "POST",
+            &format!("/containers/{start_id}/start"),
+            None,
+            None,
+        );
+        assert_eq!(started.status, 204, "{}", started.text());
+    });
+    assert_eq!(response.status, 200, "{}", response.text());
+    assert_eq!(response.json()["StatusCode"], 0);
 }
 
 #[test]

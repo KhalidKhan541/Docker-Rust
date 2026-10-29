@@ -7,10 +7,11 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
-use std::io::{self, Cursor, Read, Seek, SeekFrom};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write as IoWrite};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -43,7 +44,7 @@ use crate::query::{
 use crate::static_files::{StaticFiles, StaticOutcome};
 use crate::version::{self, VersionDecision, VersionGate, VersionUnsupported};
 
-use docker_daemon::{LogEntry, LogStore, Stream as LogStreamSource};
+use docker_daemon::{LogEntry, LogStore, Stream as LogStreamSource, WaitOutcome};
 
 /// Upper bound for an imported image archive. The body is spooled to a
 /// temporary file, so this is a disk bound rather than a memory bound.
@@ -234,6 +235,7 @@ impl ApiServer {
                     tracing::debug!(error = %error, "failed to stream Engine API response");
                 }
             }
+            Ok(Reply::Wait { outcome }) => self.respond_wait(request, outcome),
             Err(error) => {
                 let body = serde_json::to_vec(&ErrorResponse {
                     message: &error.message,
@@ -253,6 +255,89 @@ impl ApiServer {
                 }
             }
         }
+    }
+
+    /// Write a wait response directly to the connection.
+    ///
+    /// tiny_http buffers ordinary responses until the body produces data.
+    /// That would keep the `200` headers in the socket buffer while the wait
+    /// is blocked, and the Docker CLI would never issue `start`. Taking the
+    /// raw writer lets us flush the headers first, exactly as Moby does
+    /// since API 1.30, and then write the JSON body when the actor reports
+    /// the exit.
+    fn respond_wait(&self, request: Request, outcome: Receiver<Result<WaitOutcome>>) {
+        let version = request.http_version().clone();
+        let chunked = version.0 > 1 || (version.0 == 1 && version.1 >= 1);
+        let mut writer = request.into_writer();
+
+        if chunked && !self.write_wait_headers(&mut writer, &version, None) {
+            return;
+        }
+
+        let body = match outcome.recv() {
+            Ok(Ok(outcome)) => {
+                match serde_json::to_vec(&WaitResponse {
+                    status_code: i64::from(outcome.status_code),
+                    error: None,
+                }) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        tracing::debug!(error = %error, "failed to encode wait response");
+                        return;
+                    }
+                }
+            }
+            Ok(Err(error)) => {
+                tracing::debug!(error = %error, "wait failed after response headers");
+                return;
+            }
+            Err(_) => {
+                tracing::debug!("wait result channel closed before an outcome");
+                return;
+            }
+        };
+
+        let write_result = if chunked {
+            write!(writer, "{:x}\r\n", body.len())
+                .and_then(|()| writer.write_all(&body))
+                .and_then(|()| writer.write_all(b"\r\n0\r\n\r\n"))
+        } else if self.write_wait_headers(&mut writer, &version, Some(body.len())) {
+            writer.write_all(&body)
+        } else {
+            return;
+        };
+        if let Err(error) = write_result.and_then(|()| writer.flush()) {
+            tracing::debug!(error = %error, "failed to write wait response body");
+        }
+    }
+
+    /// Serialize and flush wait response headers. `content_length` is only
+    /// used for HTTP/1.0, where chunked transfer encoding is unavailable.
+    fn write_wait_headers(
+        &self,
+        writer: &mut (impl IoWrite + ?Sized),
+        version: &tiny_http::HTTPVersion,
+        content_length: Option<usize>,
+    ) -> bool {
+        let mut head = format!("HTTP/{version} 200 OK\r\n");
+        for header in self.base_headers() {
+            let _ = writeln!(head, "{}: {}", header.field.as_str(), header.value.as_str());
+        }
+        head.push_str("Content-Type: application/json\r\n");
+        if let Some(length) = content_length {
+            let _ = writeln!(head, "Content-Length: {length}");
+        } else {
+            head.push_str("Transfer-Encoding: chunked\r\n");
+        }
+        head.push_str("Connection: close\r\n\r\n");
+        writer
+            .write_all(head.as_bytes())
+            .and_then(|()| writer.flush())
+            .map_err(|error| {
+                tracing::debug!(error = %error, "failed to flush wait response headers");
+                error
+            })
+            .is_ok()
     }
 
     /// True for `POST /containers/{id}/attach` when the requested API version
@@ -1282,14 +1367,11 @@ impl ApiServer {
                 )))
             }
         };
-        let outcome = self.daemon.wait(id, condition).map_err(ApiError::from)?;
-        Ok(Reply::json(
-            200,
-            &WaitResponse {
-                status_code: i64::from(outcome.status_code),
-                error: None,
-            },
-        ))
+        let outcome = self
+            .daemon
+            .wait_start(id, condition)
+            .map_err(ApiError::from)?;
+        Ok(Reply::wait(outcome))
     }
 
     /// `GET /containers/{id}/logs` — mirrors Moby's `getContainersLogs`:
@@ -1441,6 +1523,11 @@ enum Reply {
         body: Box<dyn Read + Send>,
         headers: Vec<Header>,
     },
+    /// A registered wait. The response headers must be flushed before the
+    /// outcome is read so the Docker CLI can start the container.
+    Wait {
+        outcome: Receiver<Result<WaitOutcome>>,
+    },
 }
 
 impl Reply {
@@ -1485,9 +1572,14 @@ impl Reply {
         }
     }
 
+    fn wait(outcome: Receiver<Result<WaitOutcome>>) -> Self {
+        Self::Wait { outcome }
+    }
+
     fn with_headers(mut self, extra: Vec<Header>) -> Self {
         match &mut self {
             Self::Buffered { headers, .. } | Self::Stream { headers, .. } => headers.extend(extra),
+            Self::Wait { .. } => {}
         }
         self
     }

@@ -124,8 +124,8 @@ pub enum WaitCondition {
     /// default). A created container is already "not running".
     NotRunning,
     /// Wait for the next process exit, including an exit that is followed by
-    /// a restart-policy restart. If the container has already exited, return
-    /// its current exit status immediately.
+    /// a restart-policy restart. A container that has already exited does not
+    /// satisfy this condition; the waiter blocks until another exit.
     NextExit,
     /// Wait until the container record has been removed.
     Removed,
@@ -321,13 +321,29 @@ impl Daemon {
         })
     }
 
-    /// Block until the requested container wait condition is satisfied.
-    pub fn wait(&self, reference: &str, condition: WaitCondition) -> Result<WaitOutcome> {
+    /// Register a wait and return the receiver that will carry its outcome.
+    ///
+    /// Registration completes before this method returns. The HTTP layer can
+    /// therefore send response headers immediately (as Moby does since API
+    /// 1.30) and let the client start a container while the body remains
+    /// blocked on the receiver.
+    pub fn wait_start(
+        &self,
+        reference: &str,
+        condition: WaitCondition,
+    ) -> Result<Receiver<Result<WaitOutcome>>> {
         self.call(|reply| Command::Wait {
             reference: reference.to_string(),
             condition,
             reply,
         })
+    }
+
+    /// Block until the requested container wait condition is satisfied.
+    pub fn wait(&self, reference: &str, condition: WaitCondition) -> Result<WaitOutcome> {
+        self.wait_start(reference, condition)?
+            .recv()
+            .map_err(|_| Error::internal("daemon actor dropped the wait result"))?
     }
 
     pub fn list(&self, filters: &[ContainerFilter]) -> Result<Vec<ContainerView>> {
@@ -440,7 +456,7 @@ enum Command {
     Wait {
         reference: String,
         condition: WaitCondition,
-        reply: Sender<Result<WaitOutcome>>,
+        reply: Sender<Result<Receiver<Result<WaitOutcome>>>>,
     },
     List {
         filters: Vec<ContainerFilter>,
@@ -780,7 +796,10 @@ impl Engine {
                 reference,
                 condition,
                 reply,
-            } => self.wait(&reference, condition, reply),
+            } => {
+                let result = self.wait_start(&reference, condition);
+                let _ = reply.send(result);
+            }
             Command::List { filters, reply } => {
                 let result = self.list(&filters);
                 let _ = reply.send(result);
@@ -1100,38 +1119,25 @@ impl Engine {
         Ok(ContainerView::from_record(record, restart_count))
     }
 
-    fn wait(
+    fn wait_start(
         &mut self,
         reference: &str,
         condition: WaitCondition,
-        reply: Sender<Result<WaitOutcome>>,
-    ) {
-        let id = match self.resolve_id(reference) {
-            Ok(id) => id,
-            Err(error) => {
-                let _ = reply.send(Err(error));
-                return;
-            }
-        };
-        let record = match self.store.get(&id) {
-            Ok(record) => record,
-            Err(error) => {
-                let _ = reply.send(Err(error));
-                return;
-            }
-        };
+    ) -> Result<Receiver<Result<WaitOutcome>>> {
+        let id = self.resolve_id(reference)?;
+        let record = self.store.get(&id)?;
         let status = record.state.status;
         let current_exit = record.state.exit_code.unwrap_or(0);
+        let (reply, outcome) = mpsc::channel();
         match condition {
             WaitCondition::NotRunning if !status.is_alive() => {
                 let _ = reply.send(Ok(WaitOutcome {
                     status_code: current_exit,
                 }));
-                return;
+                return Ok(outcome);
             }
             WaitCondition::NextExit if status == LifecycleState::Removing => {
-                let _ = reply.send(Err(Error::conflict("container is being removed")));
-                return;
+                return Err(Error::conflict("container is being removed"));
             }
             _ => {}
         }
@@ -1145,6 +1151,7 @@ impl Engine {
             exit_sequence,
             reply,
         });
+        Ok(outcome)
     }
 
     /// Fulfil all waiters for `id` matching the predicate. Other conditions
