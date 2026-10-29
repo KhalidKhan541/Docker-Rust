@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use docker_api::{ApiServer, RunningServer};
 use docker_common::{Digest, ImageRef};
-use docker_daemon::{Daemon, SyntheticBehavior, SyntheticRuntime};
+use docker_daemon::{Daemon, Stream as LogStream, SyntheticBehavior, SyntheticRuntime};
 use docker_events::EventBroker;
 use docker_image::{
     Descriptor, EmptyObject, Image, ImageConfig, Manifest, Platform, RootFS,
@@ -155,6 +155,61 @@ fn http(
     }
 }
 
+/// Send an Engine attach request with the Docker CLI's TCP upgrade handshake
+/// and return the raw upgraded response. The server owns the connection until
+/// the log store reaches EOF, so this also verifies that attach closes cleanly.
+fn http_upgrade(addr: SocketAddr, path: &str) -> Response {
+    http_upgrade_with_body(addr, path, &[])
+}
+
+/// Upgrade request with an optional JSON body, used by exec-start tests.
+fn http_upgrade_with_body(addr: SocketAddr, path: &str, body: &[u8]) -> Response {
+    let mut stream = TcpStream::connect(addr).expect("connect to API listener");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: tcp\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+    stream.write_all(body).unwrap();
+    stream.flush().unwrap();
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let mut parts = line.split_whitespace();
+    let _http = parts.next();
+    let status: u16 = parts.next().expect("status code").parse().unwrap();
+    let mut headers = BTreeMap::new();
+    loop {
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers
+                .entry(name.trim().to_ascii_lowercase())
+                .or_insert_with(|| value.trim().to_string());
+        }
+    }
+    let mut body = Vec::new();
+    reader
+        .read_to_end(&mut body)
+        .expect("read upgraded response body");
+    Response {
+        status,
+        headers,
+        body,
+    }
+}
+
 fn spawn_api() -> (RunningServer, Arc<SyntheticRuntime>) {
     let runtime = Arc::new(SyntheticRuntime::with_behavior(
         SyntheticBehavior::running_until_killed(),
@@ -164,6 +219,17 @@ fn spawn_api() -> (RunningServer, Arc<SyntheticRuntime>) {
     let api = Arc::new(ApiServer::new(daemon, broker));
     let server = api.serve("127.0.0.1:0").unwrap();
     (server, runtime)
+}
+
+fn spawn_api_with_daemon() -> (RunningServer, Arc<Daemon>) {
+    let runtime = Arc::new(SyntheticRuntime::with_behavior(
+        SyntheticBehavior::running_until_killed(),
+    ));
+    let broker = Arc::new(EventBroker::new());
+    let daemon = Arc::new(Daemon::spawn(runtime, broker.clone()).unwrap());
+    let api = Arc::new(ApiServer::new(daemon.clone(), broker));
+    let server = api.serve("127.0.0.1:0").unwrap();
+    (server, daemon)
 }
 
 fn spawn_api_with_web_root(root: &Path) -> RunningServer {
@@ -1447,4 +1513,81 @@ fn image_pull_uses_the_registry_client_and_persists_metadata() {
             .cmd,
         vec!["/fixture".to_string()]
     );
+}
+
+#[test]
+fn attach_supports_upgrade_logs_and_stream_filters() {
+    let (server, daemon) = spawn_api_with_daemon();
+    let addr = server.addr();
+    let id = create(addr, "attach-target", "alpine:3.20", None);
+    let store = daemon
+        .log_store(&id)
+        .expect("read attach log store")
+        .expect("container has a log store");
+    store.append(LogStream::Stdout, b"out\n");
+    store.append(LogStream::Stderr, b"err\n");
+    store.close();
+
+    let response = http_upgrade(
+        addr,
+        &format!("/v1.51/containers/{id}/attach?stream=1&logs=1&stdout=1&stderr=1"),
+    );
+    assert_eq!(response.status, 101);
+    assert_eq!(
+        response.header("content-type"),
+        Some("application/vnd.docker.multiplexed-stream")
+    );
+    assert_eq!(response.header("upgrade"), Some("tcp"));
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 4]);
+    expected.extend_from_slice(b"out\n");
+    expected.extend_from_slice(&[2, 0, 0, 0, 0, 0, 0, 4]);
+    expected.extend_from_slice(b"err\n");
+    assert_eq!(response.body, expected);
+
+    let stdout_only = http_upgrade(
+        addr,
+        &format!("/containers/{id}/attach?stream=1&logs=1&stdout=1&stderr=0"),
+    );
+    assert_eq!(stdout_only.status, 101);
+    assert_eq!(
+        stdout_only.body,
+        [1, 0, 0, 0, 0, 0, 0, 4, b'o', b'u', b't', b'\n']
+    );
+
+    let no_logs = http_upgrade(
+        addr,
+        &format!("/containers/{id}/attach?stream=1&logs=0&stdout=1&stderr=1"),
+    );
+    assert_eq!(no_logs.status, 101);
+    assert!(no_logs.body.is_empty());
+
+    let missing = http(
+        addr,
+        "POST",
+        "/containers/does-not-exist/attach?stdout=1",
+        None,
+        None,
+    );
+    assert_eq!(missing.status, 404, "{}", missing.text());
+    assert!(missing.text().contains("no such container"));
+
+    let stdin = http(
+        addr,
+        "POST",
+        &format!("/containers/{id}/attach?stdin=1&stdout=1"),
+        None,
+        None,
+    );
+    assert_eq!(stdin.status, 501, "{}", stdin.text());
+    assert!(stdin.text().contains("stdin is not implemented"));
+
+    let too_new = http(
+        addr,
+        "POST",
+        &format!("/v1.52/containers/{id}/attach?stdout=1"),
+        None,
+        None,
+    );
+    assert_eq!(too_new.status, 400, "{}", too_new.text());
 }

@@ -124,6 +124,48 @@ fn hex(byte: u8) -> Option<u8> {
     }
 }
 
+/// Parameters for `POST /containers/{id}/attach`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachOptions {
+    pub stream: bool,
+    pub stdin: bool,
+    pub stdout: bool,
+    pub stderr: bool,
+    pub logs: bool,
+    pub detach_keys: Option<String>,
+}
+
+impl AttachOptions {
+    pub fn parse(query: &Query) -> Result<Self> {
+        let options = Self {
+            stream: query.bool_value("stream", false),
+            stdin: query.bool_value("stdin", false),
+            stdout: query.bool_value("stdout", false),
+            stderr: query.bool_value("stderr", false),
+            logs: query.bool_value("logs", false),
+            detach_keys: query
+                .get("detachKeys")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        };
+        if !options.stdin && !options.stdout && !options.stderr {
+            return Err(Error::invalid_argument(
+                "attach requires at least one of stdin, stdout, or stderr",
+            ));
+        }
+        if options.stdin {
+            return Err(Error::unsupported(
+                "attach stdin is not implemented; use stdin=0 or detach and use docker exec later",
+            ));
+        }
+        // Detach keys only matter while stdin is attached. The Docker CLI may
+        // fill this from the user's config even for output-only attaches, so
+        // accept it and leave it unused rather than breaking the run.
+        Ok(options)
+    }
+}
+
 /// Decoded filter object.
 #[derive(Debug, Clone, Default)]
 pub struct FilterSet {
@@ -863,6 +905,27 @@ mod tests {
         let query = Query::parse("stdout=1&stderr=1&since=2000-01-01T00:00:00Z").unwrap();
         let options = LogsOptions::parse(&query).unwrap();
         assert_eq!(options.since_nanos, Some(946_684_800_000_000_000));
+    }
+
+    #[test]
+    fn parses_attach_options_and_rejects_unimplemented_modes() {
+        let query = Query::parse("stream=1&logs=1&stdout=1&stderr=0").unwrap();
+        let options = AttachOptions::parse(&query).unwrap();
+        assert!(options.stream && options.logs && options.stdout);
+        assert!(!options.stderr && !options.stdin);
+        assert_eq!(options.detach_keys, None);
+
+        let query = Query::parse("stdout=1&stdin=1").unwrap();
+        let error = AttachOptions::parse(&query).unwrap_err();
+        assert_eq!(error.kind(), docker_errors::ErrorKind::Unsupported);
+
+        let query = Query::parse("stdout=0&stderr=0").unwrap();
+        let error = AttachOptions::parse(&query).unwrap_err();
+        assert_eq!(error.kind(), docker_errors::ErrorKind::InvalidArgument);
+
+        let query = Query::parse("stdout=1&detachKeys=ctrl-p%2Cctrl-q").unwrap();
+        let options = AttachOptions::parse(&query).unwrap();
+        assert_eq!(options.detach_keys.as_deref(), Some("ctrl-p,ctrl-q"));
     }
 
     #[test]

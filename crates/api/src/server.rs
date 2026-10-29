@@ -36,7 +36,9 @@ use crate::image_dto::{
     history_items, ImageDeleteItem, ImageInspectResponse, ImageLoadMessage, ImagePullMessage,
     ImageSummary,
 };
-use crate::query::{ContainerListOptions, EventFilters, EventOptions, LogsOptions, Query};
+use crate::query::{
+    AttachOptions, ContainerListOptions, EventFilters, EventOptions, LogsOptions, Query,
+};
 use crate::static_files::{StaticFiles, StaticOutcome};
 use crate::version::{self, VersionDecision, VersionGate, VersionUnsupported};
 
@@ -177,7 +179,18 @@ impl ApiServer {
     }
 
     fn handle_request(&self, mut request: Request) {
+        // Attach takes over the HTTP connection, so it has to be recognized
+        // before the ordinary request/Reply path, which still owns the request
+        // for its response.
+        if self.is_attach_request(&request) {
+            self.handle_attach(request);
+            return;
+        }
         let result = self.route(&mut request);
+        self.respond(request, result);
+    }
+
+    fn respond(&self, request: Request, result: std::result::Result<Reply, ApiError>) {
         match result {
             Ok(Reply::Buffered {
                 status,
@@ -234,6 +247,174 @@ impl ApiServer {
                     tracing::debug!(error = %write_error, "failed to write Engine API error");
                 }
             }
+        }
+    }
+
+    /// True for `POST /containers/{id}/attach` when the requested API version
+    /// is in range. Version errors keep the normal JSON error path.
+    fn is_attach_request(&self, request: &Request) -> bool {
+        if request.method().as_str() != "POST" {
+            return false;
+        }
+        let url = request.url();
+        let path = url.split_once('?').map_or(url, |(path, _)| path);
+        let (requested, path) = version::split_version(path);
+        if !self.gate.check(requested).is_accepted() {
+            return false;
+        }
+        let segments: Vec<&str> = path
+            .trim_matches('/')
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        matches!(segments.as_slice(), ["containers", _, "attach"])
+    }
+
+    /// Engine `POST /containers/{id}/attach`.
+    ///
+    /// Output is sourced from the same lossless log store as `docker logs`,
+    /// so attach has one ordering and follows the same close signal. With
+    /// `Upgrade: tcp` (what the Docker CLI sends) the connection is handed to
+    /// a raw stdcopy stream; without an upgrade, a normal chunked HTTP stream
+    /// is returned for simple clients. Stdin and TTY are still rejected at the
+    /// API boundary rather than pretended.
+    fn handle_attach(&self, request: Request) {
+        let url = request.url().to_string();
+        let (path, raw_query) = match url.split_once('?') {
+            Some((path, query)) => (path, query),
+            None => (url.as_str(), ""),
+        };
+        let (_, path) = version::split_version(path);
+        let segments: Vec<&str> = path
+            .trim_matches('/')
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        let Some(id) = segments.get(1).copied() else {
+            self.respond(request, Err(ApiError::not_found("page not found")));
+            return;
+        };
+        let query = match Query::parse(raw_query) {
+            Ok(query) => query,
+            Err(error) => {
+                self.respond(request, Err(ApiError::from(error)));
+                return;
+            }
+        };
+        let options = match AttachOptions::parse(&query) {
+            Ok(options) => options,
+            Err(error) => {
+                self.respond(request, Err(ApiError::from(error)));
+                return;
+            }
+        };
+        let store = match self.daemon.log_store(id) {
+            Ok(Some(store)) => store,
+            Ok(None) => {
+                self.respond(
+                    request,
+                    Err(ApiError::not_found(format!("no such container: {id}"))),
+                );
+                return;
+            }
+            Err(error) => {
+                self.respond(request, Err(ApiError::from(error)));
+                return;
+            }
+        };
+        let stream = match (options.stdout, options.stderr) {
+            (true, true) => None,
+            (true, false) => Some(LogStreamSource::Stdout),
+            (false, true) => Some(LogStreamSource::Stderr),
+            (false, false) => {
+                self.respond(
+                    request,
+                    Err(ApiError::bad_request(
+                        "attach requires stdout or stderr; stdin is not implemented",
+                    )),
+                );
+                return;
+            }
+        };
+        let (replay, next) = attach_replay(&store, &options, stream);
+        let entry_stream = EntryStream {
+            store,
+            replay,
+            next,
+            stream,
+            timestamps: false,
+            since_nanos: None,
+            until_nanos: None,
+            current: Vec::new(),
+            offset: 0,
+            closed: !options.stream,
+        };
+
+        let upgrade = request
+            .headers()
+            .iter()
+            .any(|header| header.field.equiv("Upgrade"));
+        if !upgrade {
+            if options.stream {
+                self.respond(
+                    request,
+                    Ok(Reply::stream(
+                        VIEW_MULTIPLEXED_STREAM,
+                        Box::new(entry_stream),
+                    )),
+                );
+            } else {
+                let mut body = Vec::new();
+                let mut entry_stream = entry_stream;
+                match entry_stream.read_to_end(&mut body) {
+                    Ok(_) => {
+                        self.respond(
+                            request,
+                            Ok(Reply::buffered(200, VIEW_MULTIPLEXED_STREAM, body)),
+                        );
+                    }
+                    Err(error) => {
+                        self.respond(
+                            request,
+                            Err(ApiError::from(Error::internal(format!(
+                                "reading container attach backlog: {error}"
+                            )))),
+                        );
+                    }
+                }
+            }
+            return;
+        }
+
+        let mut headers = self.base_headers();
+        headers.push(header("Content-Type", VIEW_MULTIPLEXED_STREAM));
+        let response = Response::new(
+            StatusCode(101),
+            headers,
+            Cursor::new(Vec::new()),
+            Some(0),
+            None,
+        );
+        let mut connected = request.upgrade("tcp", response);
+        let mut entry_stream = entry_stream;
+        let mut buffer = [0u8; 8192];
+        loop {
+            match entry_stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    if let Err(error) = connected.write_all(&buffer[..count]) {
+                        tracing::debug!(error = %error, "attach client disconnected");
+                        break;
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(error = %error, "reading attach stream failed");
+                    break;
+                }
+            }
+        }
+        if let Err(error) = connected.flush() {
+            tracing::debug!(error = %error, "flushing attach stream failed");
         }
     }
 
@@ -1605,6 +1786,23 @@ fn now_nano() -> i64 {
 /// `multiplexed-stream` for non-TTY containers since API 1.42, our minimum
 /// advertised version).
 const VIEW_MULTIPLEXED_STREAM: &str = "application/vnd.docker.multiplexed-stream";
+
+/// Build the attach backlog and the first unseen sequence. `logs=0` starts at
+/// the current end of the store; `logs=1` replays everything still retained.
+fn attach_replay(
+    store: &LogStore,
+    options: &AttachOptions,
+    stream: Option<LogStreamSource>,
+) -> (VecDeque<Vec<u8>>, u64) {
+    let from = if options.logs { 0 } else { store.latest_seq() };
+    let (records, _) = store.entries_and_state(from, stream);
+    let replay = records
+        .iter()
+        .map(|entry| frame_entry(entry, false))
+        .collect();
+    let next = records.last().map_or(from, |entry| entry.seq + 1);
+    (replay, next)
+}
 
 /// Long-lived `/containers/{id}/logs?follow=1` response body. Framed backlog
 /// first, then new records until the container's captured pipes reach EOF,
